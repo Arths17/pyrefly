@@ -2007,8 +2007,8 @@
     {
       "code": -2,
       "column": 5,
-      "concise_description": "`Callable` requires exactly two arguments but 1 was found",
-      "description": "`Callable` requires exactly two arguments but 1 was found",
+      "concise_description": "Expected 2 arguments for `Callable`, got 1",
+      "description": "Expected 2 arguments for `Callable`, got 1",
       "line": 55,
       "name": "bad-specialization",
       "severity": "error",
@@ -2040,8 +2040,8 @@
     {
       "code": -2,
       "column": 5,
-      "concise_description": "`Callable` requires exactly two arguments but 3 was found",
-      "description": "`Callable` requires exactly two arguments but 3 was found",
+      "concise_description": "Expected 2 arguments for `Callable`, got 3",
+      "description": "Expected 2 arguments for `Callable`, got 3",
       "line": 58,
       "name": "bad-specialization",
       "severity": "error",
@@ -5987,23 +5987,12 @@
     {
       "code": -2,
       "column": 13,
-      "concise_description": "Unexpected keyword argument `x` in function `foo`",
-      "description": "Unexpected keyword argument `x` in function `foo`",
+      "concise_description": "Expected argument `x` to be positional in function `foo`",
+      "description": "Expected argument `x` to be positional in function `foo`",
       "line": 83,
       "name": "unexpected-keyword",
       "severity": "error",
       "stop_column": 14,
-      "stop_line": 83
-    },
-    {
-      "code": -2,
-      "column": 13,
-      "concise_description": "Expected 1 more positional argument in function `foo`",
-      "description": "Expected 1 more positional argument in function `foo`",
-      "line": 83,
-      "name": "bad-argument-count",
-      "severity": "error",
-      "stop_column": 16,
       "stop_line": 83
     },
     {
