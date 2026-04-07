@@ -1,75 +1,75 @@
 {
   "name": "test",
   "names": [
-    "test.outer",
-    "test.top_level",
-    "test.TopLevel.method",
-    "test.TopLevel"
+    "test.RegularClass.name",
+    "test.regular_function",
+    "test.RegularClass.__init__",
+    "test.RegularClass"
   ],
-  "line_count": 26,
+  "line_count": 30,
   "symbol_reports": [
     {
-      "kind": "function",
-      "name": "test.outer",
+      "kind": "attr",
+      "name": "test.RegularClass.name",
       "n_typable": 1,
-      "n_typed": 1,
+      "n_typed": 0,
       "n_any": 0,
-      "n_untyped": 0,
+      "n_untyped": 1,
       "location": {
-        "line": 7,
-        "column": 1
+        "line": 29,
+        "column": 14
       }
     },
     {
       "kind": "function",
-      "name": "test.top_level",
-      "n_typable": 2,
+      "name": "test.regular_function",
+      "n_typable": 3,
       "n_typed": 2,
       "n_any": 0,
-      "n_untyped": 0,
+      "n_untyped": 1,
       "location": {
-        "line": 19,
+        "line": 23,
         "column": 1
       }
     },
     {
       "kind": "function",
-      "name": "test.TopLevel.method",
+      "name": "test.RegularClass.__init__",
       "n_typable": 1,
       "n_typed": 1,
       "n_any": 0,
       "n_untyped": 0,
       "location": {
-        "line": 24,
+        "line": 28,
         "column": 5
       }
     },
     {
       "kind": "class",
-      "name": "test.TopLevel",
+      "name": "test.RegularClass",
       "n_typable": 0,
       "n_typed": 0,
       "n_any": 0,
       "n_untyped": 0,
       "location": {
-        "line": 23,
+        "line": 27,
         "column": 1
       }
     }
   ],
   "type_ignores": [],
-  "n_typable": 4,
-  "n_typed": 4,
+  "n_typable": 5,
+  "n_typed": 3,
   "n_any": 0,
-  "n_untyped": 0,
-  "coverage": 100.0,
-  "strict_coverage": 100.0,
-  "n_functions": 2,
+  "n_untyped": 2,
+  "coverage": 60.0,
+  "strict_coverage": 60.0,
+  "n_functions": 1,
   "n_methods": 1,
-  "n_function_params": 1,
-  "n_method_params": 0,
+  "n_function_params": 2,
+  "n_method_params": 1,
   "n_classes": 1,
-  "n_attrs": 0,
+  "n_attrs": 1,
   "n_properties": 0,
   "n_type_ignores": 0
 }

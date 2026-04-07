@@ -1,18 +1,18 @@
 {
-  "name": "test",
+  "name": "my.package.module",
   "names": [
-    "test.foo",
-    "test.foo_unannotated",
-    "test.C.bar",
-    "test.C.Inner.baz",
-    "test.C",
-    "test.C.Inner"
+    "my.package.module.foo",
+    "my.package.module.foo_unannotated",
+    "my.package.module.C.bar",
+    "my.package.module.C.Inner.baz",
+    "my.package.module.C",
+    "my.package.module.C.Inner"
   ],
   "line_count": 22,
   "symbol_reports": [
     {
       "kind": "function",
-      "name": "test.foo",
+      "name": "my.package.module.foo",
       "n_typable": 3,
       "n_typed": 3,
       "n_any": 0,
@@ -24,7 +24,7 @@
     },
     {
       "kind": "function",
-      "name": "test.foo_unannotated",
+      "name": "my.package.module.foo_unannotated",
       "n_typable": 3,
       "n_typed": 0,
       "n_any": 0,
@@ -36,7 +36,7 @@
     },
     {
       "kind": "function",
-      "name": "test.C.bar",
+      "name": "my.package.module.C.bar",
       "n_typable": 3,
       "n_typed": 3,
       "n_any": 0,
@@ -48,7 +48,7 @@
     },
     {
       "kind": "function",
-      "name": "test.C.Inner.baz",
+      "name": "my.package.module.C.Inner.baz",
       "n_typable": 3,
       "n_typed": 3,
       "n_any": 0,
@@ -60,7 +60,7 @@
     },
     {
       "kind": "class",
-      "name": "test.C",
+      "name": "my.package.module.C",
       "n_typable": 0,
       "n_typed": 0,
       "n_any": 0,
@@ -72,7 +72,7 @@
     },
     {
       "kind": "class",
-      "name": "test.C.Inner",
+      "name": "my.package.module.C.Inner",
       "n_typable": 0,
       "n_typed": 0,
       "n_any": 0,

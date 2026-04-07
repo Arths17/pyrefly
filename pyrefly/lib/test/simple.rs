@@ -644,11 +644,11 @@ testcase!(
     r#"
 from typing import Callable, Optional, Type, TypeGuard, TypeIs
 
-def test0() -> Type[int, int]: ...  # E: requires exactly one argument
-def test1() -> TypeGuard[int, int]: ...  # E: requires exactly one argument
-def test2() -> TypeIs[int, int]: ...  # E: requires exactly one argument
-def test3() -> Optional[int, int]: ...  # E: requires exactly one argument
-def test4() -> Callable[[], int, int]: ...  # E: requires exactly two arguments
+def test0() -> Type[int, int]: ...  # E: Expected 1 type argument
+def test1() -> TypeGuard[int, int]: ...  # E: Expected 1 type argument
+def test2() -> TypeIs[int, int]: ...  # E: Expected 1 type argument
+def test3() -> Optional[int, int]: ...  # E: Expected 1 type argument
+def test4() -> Callable[[], int, int]: ...  # E: Expected 2 arguments
 "#,
 );
 
@@ -1732,6 +1732,22 @@ testcase!(
 from typing import Any, Callable
 def g(f: Callable[[Any], int], inputs: Any) -> None:
     sum(map(f, inputs))
+    "#,
+);
+
+testcase!(
+    test_map_str_method_with_splitlines,
+    r#"
+def main(a: str) -> None:
+    _ = map(str.strip, a.splitlines())
+    "#,
+);
+
+testcase!(
+    test_str_maketrans_with_dict,
+    r#"
+def main() -> None:
+    _ = str.maketrans({"a": "b", "c": None})
     "#,
 );
 

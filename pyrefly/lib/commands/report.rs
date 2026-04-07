@@ -14,6 +14,7 @@ use clap::Parser;
 use pyrefly_build::handle::Handle;
 use pyrefly_config::args::ConfigOverrideArgs;
 use pyrefly_config::finder::ConfigFinder;
+use pyrefly_graph::index::Idx;
 use pyrefly_python::ignore::Ignore;
 use pyrefly_python::ignore::Tool;
 use pyrefly_python::module::Module;
@@ -46,6 +47,7 @@ use crate::binding::binding::KeyAnnotation;
 use crate::binding::binding::KeyClass;
 use crate::binding::binding::KeyClassField;
 use crate::binding::binding::KeyClassMro;
+use crate::binding::binding::KeyDecorator;
 use crate::binding::binding::KeyExport;
 use crate::binding::binding::ReturnTypeKind;
 use crate::binding::bindings::Bindings;
@@ -167,6 +169,8 @@ struct Function {
     parameters: Vec<Parameter>,
     is_type_known: bool,
     is_property: bool,
+    /// Number of non-self/cls, non-implicit params (for entity counting).
+    n_params: usize,
     slots: SlotCounts,
     location: Location,
 }
@@ -239,6 +243,14 @@ struct ModuleReport {
     slots: SlotCounts,
     coverage: f64,
     strict_coverage: f64,
+    n_functions: usize,
+    n_methods: usize,
+    n_function_params: usize,
+    n_method_params: usize,
+    n_classes: usize,
+    n_attrs: usize,
+    n_properties: usize,
+    n_type_ignores: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -279,6 +291,13 @@ pub struct ReportArgs {
     /// file is also present in the set of files to check.
     #[clap(long, default_value_t = true, action = clap::ArgAction::Set)]
     prefer_stubs: bool,
+
+    /// Override the module name in the report output. When set, all modules
+    /// use this name instead of the name derived from the file path. Useful
+    /// when reporting on a single module whose canonical package name differs
+    /// from its filesystem layout.
+    #[clap(long)]
+    module: Option<String>,
 }
 
 impl ReportArgs {
@@ -293,6 +312,7 @@ impl ReportArgs {
             files_to_check,
             config_finder,
             self.prefer_stubs,
+            self.module,
             thread_count,
         )
     }
@@ -391,6 +411,16 @@ impl ReportArgs {
         }
     }
 
+    /// Returns true if the name is public: does not start with `_`, or is a dunder (`__x__`).
+    /// Matches typestats `is_public_name`.
+    fn is_public_name(name: &str) -> bool {
+        !name.starts_with('_') || name.ends_with("__")
+    }
+
+    /// Module-level dunders that typestats always excludes from the report.
+    const EXCLUDED_MODULE_DUNDERS: &'static [&'static str] =
+        &["__all__", "__dir__", "__doc__", "__getattr__"];
+
     /// Returns true if the first parameter is self/cls (implicit, excluded from slot counting).
     fn is_self_or_cls(index: usize, name: &str) -> bool {
         index == 0 && (name == "self" || name == "cls")
@@ -419,6 +449,12 @@ impl ReportArgs {
         let mut variables = Vec::new();
         for idx in bindings.keys::<KeyExport>() {
             let KeyExport(name) = bindings.idx_to_key(idx);
+            // Skip non-public module-level names and excluded dunders.
+            let name_str = name.as_str();
+            if !Self::is_public_name(name_str) || Self::EXCLUDED_MODULE_DUNDERS.contains(&name_str)
+            {
+                continue;
+            }
             let qualified_name = format!("{module_prefix}{name}");
             if reported_names.contains(qualified_name.as_str()) {
                 continue;
@@ -459,6 +495,9 @@ impl ReportArgs {
                         Binding::Global(_) => {}
                         // IMPLICIT: special type forms have 0 slots
                         Binding::TypeVar(_) | Binding::ParamSpec(_) | Binding::TypeVarTuple(_) => {}
+                        // Functions and classes are handled by parse_functions/parse_classes;
+                        // skip them here even when excluded (e.g. @type_check_only).
+                        Binding::Function(..) | Binding::ClassDef(..) => {}
                         // IMPLICIT: non-call assignments have 0 slots;
                         // call assignments are untyped (1 slot)
                         Binding::NameAssign(na) => {
@@ -498,6 +537,7 @@ impl ReportArgs {
         module: &Module,
         bindings: &Bindings,
         answers: &Answers,
+        tco_classes: &HashSet<Idx<KeyClass>>,
     ) -> Vec<Variable> {
         let mut attrs = Vec::new();
         let module_prefix = if module.name() != ModuleName::unknown() {
@@ -508,6 +548,21 @@ impl ReportArgs {
 
         for field_idx in bindings.keys::<KeyClassField>() {
             let field = bindings.get(field_idx);
+
+            // Skip private class attrs (single-underscore prefix).
+            if !Self::is_public_name(field.name.as_str()) {
+                continue;
+            }
+
+            // Skip class-body dunder attrs with implicit types (__slots__, __doc__, etc.)
+            if Self::is_implicit_dunder_attr(field.name.as_str()) {
+                continue;
+            }
+
+            // Skip attrs of @type_check_only classes.
+            if tco_classes.contains(&field.class_idx) {
+                continue;
+            }
 
             // Only count instance attrs from recognized methods (__init__, etc.)
             let annotation_idx = match &field.definition {
@@ -575,6 +630,7 @@ impl ReportArgs {
         bindings: &Bindings,
         answers: &Answers,
         exports: &SmallMap<Name, ExportLocation>,
+        tco_classes: &HashSet<Idx<KeyClass>>,
     ) -> Vec<Function> {
         let mut functions = Vec::new();
         let module_prefix = if module.name() != ModuleName::unknown() {
@@ -587,13 +643,41 @@ impl ReportArgs {
             if let Key::Definition(id) = bindings.idx_to_key(idx)
                 && let Binding::Function(x, _pred, _class_meta) = bindings.get(idx)
             {
-                let fun = bindings.get(bindings.get(*x).undecorated_idx);
+                let decorated = bindings.get(*x);
+                let fun = bindings.get(decorated.undecorated_idx);
+                // Skip @type_check_only decorated functions.
+                if Self::has_type_check_only_decorator(&fun.decorators, bindings) {
+                    continue;
+                }
+                // Skip methods of @type_check_only decorated classes.
+                if fun.class_key.is_some_and(|ck| tco_classes.contains(&ck)) {
+                    continue;
+                }
+                // Skip overload implementation signatures — only @overload
+                // decorated signatures are part of the public API.
+                if let Some(pred) = _pred
+                    && let Binding::Function(pred_x, _, _) = bindings.get(*pred)
+                {
+                    let pred_is_overload = answers
+                        .get_idx(bindings.get(*pred_x).undecorated_idx)
+                        .is_some_and(|u| u.metadata.flags.is_overload);
+                    let this_is_overload = answers
+                        .get_idx(decorated.undecorated_idx)
+                        .is_some_and(|u| u.metadata.flags.is_overload);
+                    if pred_is_overload && !this_is_overload {
+                        continue;
+                    }
+                }
                 let location = Self::range_to_location(module, fun.def.range);
                 let func_name = if let Some(class_key) = fun.class_key {
                     match bindings.get(class_key) {
                         BindingClass::ClassDef(cls) => {
                             // Skip methods of classes nested inside functions
                             if Self::has_function_ancestor(&cls.parent) {
+                                continue;
+                            }
+                            // Skip private class methods (single-underscore prefix).
+                            if !Self::is_public_name(fun.def.name.as_str()) {
                                 continue;
                             }
                             let class_qname =
@@ -608,6 +692,10 @@ impl ReportArgs {
                     // Skip functions not present in the module's exports
                     // (e.g. functions nested inside other functions).
                     if !exports.contains_key(&fun.def.name.id) {
+                        continue;
+                    }
+                    // Skip non-public module-level functions.
+                    if !Self::is_public_name(fun.def.name.as_str()) {
                         continue;
                     }
                     format!("{}{}", module_prefix, fun.def.name)
@@ -651,6 +739,7 @@ impl ReportArgs {
                     Self::classify_slot(return_annotation.is_some(), is_return_type_known)
                 };
                 let mut func_slots = return_slot;
+                let mut n_params = 0usize;
 
                 for (i, param) in all_params.iter().enumerate() {
                     let param_name = param.name.as_str();
@@ -675,14 +764,28 @@ impl ReportArgs {
                         false
                     };
 
-                    if !is_param_type_known && !Self::is_self_or_cls(i, param_name) {
+                    // Check if this non-self param has an implicit type for a dunder method.
+                    // Like implicit returns, only applies when annotation is absent.
+                    let is_implicit_param = !Self::is_self_or_cls(i, param_name)
+                        && fun.class_key.is_some()
+                        && param_annotation.is_none()
+                        && Self::is_implicit_dunder_param(
+                            fun.def.name.as_str(),
+                            i.saturating_sub(1),
+                        );
+
+                    if !is_param_type_known
+                        && !Self::is_self_or_cls(i, param_name)
+                        && !is_implicit_param
+                    {
                         all_params_type_known = false;
                     }
 
-                    if !Self::is_self_or_cls(i, param_name) {
+                    if !Self::is_self_or_cls(i, param_name) && !is_implicit_param {
                         let param_slot =
                             Self::classify_slot(param_annotation.is_some(), is_param_type_known);
                         func_slots = func_slots.merge(param_slot);
+                        n_params += 1;
                     }
 
                     parameters.push(Parameter {
@@ -711,6 +814,7 @@ impl ReportArgs {
                     parameters,
                     is_type_known,
                     is_property,
+                    n_params,
                     slots: func_slots,
                     location,
                 });
@@ -749,6 +853,7 @@ impl ReportArgs {
                         parameters: target_func.parameters.clone(),
                         is_type_known: target_func.is_type_known,
                         is_property: target_func.is_property,
+                        n_params: target_func.n_params,
                     });
                 }
             }
@@ -820,7 +925,94 @@ impl ReportArgs {
                 | "__delattr__"
                 | "__setitem__"
                 | "__delitem__"
+                | "__dir__"
+                | "__instancecheck__"
+                | "__subclasscheck__"
+                | "__set__"
+                | "__delete__"
+                | "__set_name__"
+                | "__buffer__"
+                | "__release_buffer__"
+                | "__mro_entries__"
+                | "__subclasses__"
         )
+    }
+
+    /// Dunder method parameters whose types are fully determined by the
+    /// protocol (e.g. `__exit__`'s exception triple, `__getattr__`'s `name: str`).
+    /// Positions are 0-indexed after excluding self/cls.
+    /// Only applies when the annotation is absent — explicit annotations count normally.
+    fn is_implicit_dunder_param(name: &str, non_self_param_pos: usize) -> bool {
+        match name {
+            // __exit__/__aexit__(self, exc_type, exc_val, exc_tb)
+            "__exit__" | "__aexit__" => non_self_param_pos <= 2,
+            // First non-self param is protocol-fixed (str, int, or memoryview)
+            "__getattr__" | "__delattr__" | "__setattr__" | "__format__" | "__buffer__"
+            | "__release_buffer__" => non_self_param_pos == 0,
+            // __set_name__(self, owner, name: str) — name at position 1
+            "__set_name__" => non_self_param_pos == 1,
+            _ => false,
+        }
+    }
+
+    /// Class-body dunder attributes whose types are implicit (determined by
+    /// the Python runtime). These should be excluded from coverage counting.
+    fn is_implicit_dunder_attr(name: &str) -> bool {
+        matches!(
+            name,
+            "__annotations__"
+                | "__base__"
+                | "__bases__"
+                | "__class__"
+                | "__dict__"
+                | "__doc__"
+                | "__firstlineno__"
+                | "__match_args__"
+                | "__module__"
+                | "__mro__"
+                | "__name__"
+                | "__objclass__"
+                | "__qualname__"
+                | "__slots__"
+                | "__static_attributes__"
+                | "__type_params__"
+                | "__weakref__"
+        )
+    }
+
+    /// Check whether a decorator expression matches `type_check_only`.
+    /// Handles `@type_check_only`, `@typing.type_check_only`, and call forms.
+    fn is_type_check_only_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::Name(name) => name.id.as_str() == "type_check_only",
+            Expr::Attribute(attr) => attr.attr.as_str() == "type_check_only",
+            Expr::Call(call) => Self::is_type_check_only_expr(&call.func),
+            _ => false,
+        }
+    }
+
+    /// Check if any decorator in the list is `@type_check_only`.
+    fn has_type_check_only_decorator(
+        decorators: &[Idx<KeyDecorator>],
+        bindings: &Bindings,
+    ) -> bool {
+        decorators.iter().any(|&dec_idx| {
+            let decorator = bindings.get(dec_idx);
+            Self::is_type_check_only_expr(&decorator.expr)
+        })
+    }
+
+    /// Collect all class keys that have the `@type_check_only` decorator.
+    fn collect_type_check_only_classes(bindings: &Bindings) -> HashSet<Idx<KeyClass>> {
+        let mut tco_classes = HashSet::new();
+        for idx in bindings.keys::<Key>() {
+            if let Binding::ClassDef(class_key, decorators) = bindings.get(idx)
+                && Self::has_type_check_only_decorator(decorators, bindings)
+            {
+                tco_classes.insert(*class_key);
+            }
+        }
+        tco_classes
     }
 
     /// Determine whether a function name represents a method (contains '.', i.e. `Cls.method`).
@@ -829,7 +1021,7 @@ impl ReportArgs {
         without_prefix.contains('.')
     }
 
-    /// Calculate the aggregate summary for all module reports.
+    /// Calculate the aggregate summary by summing per-module entity counts.
     fn calculate_summary(module_reports: &[ModuleReport]) -> ReportSummary {
         let n_modules = module_reports.len();
         let mut total_slots = SlotCounts::default();
@@ -844,32 +1036,14 @@ impl ReportArgs {
 
         for module in module_reports {
             total_slots = total_slots.merge(module.slots);
-            n_type_ignores += module.type_ignores.len();
-
-            let module_prefix = format!("{}.", module.name);
-            for sym in &module.symbol_reports {
-                match sym {
-                    SymbolReport::Function { name, slots, .. } => {
-                        let params = slots.n_typable.saturating_sub(1);
-                        if Self::is_method(name, &module_prefix) {
-                            n_methods += 1;
-                            n_method_params += params;
-                        } else {
-                            n_functions += 1;
-                            n_function_params += params;
-                        }
-                    }
-                    SymbolReport::Property { .. } => {
-                        n_properties += 1;
-                    }
-                    SymbolReport::Attr { .. } => {
-                        n_attrs += 1;
-                    }
-                    SymbolReport::Class { .. } => {
-                        n_classes += 1;
-                    }
-                }
-            }
+            n_functions += module.n_functions;
+            n_methods += module.n_methods;
+            n_function_params += module.n_function_params;
+            n_method_params += module.n_method_params;
+            n_classes += module.n_classes;
+            n_attrs += module.n_attrs;
+            n_properties += module.n_properties;
+            n_type_ignores += module.n_type_ignores;
         }
 
         ReportSummary {
@@ -894,6 +1068,7 @@ impl ReportArgs {
         answers: &Answers,
         transaction: &Transaction,
         handle: &Handle,
+        tco_classes: &HashSet<Idx<KeyClass>>,
     ) -> Vec<ReportClass> {
         let mut classes = Vec::new();
         let module_prefix = if module.name() != ModuleName::unknown() {
@@ -902,6 +1077,10 @@ impl ReportArgs {
             String::new()
         };
         for class_idx in bindings.keys::<KeyClass>() {
+            // Skip @type_check_only classes.
+            if tco_classes.contains(&class_idx) {
+                continue;
+            }
             let binding_class = bindings.get(class_idx);
             let cls_binding = match binding_class {
                 BindingClass::ClassDef(cls) => cls,
@@ -1060,6 +1239,7 @@ impl ReportArgs {
 
     fn build_module_report(
         name: String,
+        derived_name: &str,
         line_count: usize,
         functions: &[Function],
         variables: &[Variable],
@@ -1107,6 +1287,38 @@ impl ReportArgs {
             });
         }
 
+        // Compute per-module entity counts. Use the derived (file-based)
+        // module name for prefix matching, since symbol names are built from
+        // the derived name and only rewritten to the override name later.
+        let module_prefix = format!("{}.", derived_name);
+        let mut n_functions = 0usize;
+        let mut n_methods = 0usize;
+        let mut n_function_params = 0usize;
+        let mut n_method_params = 0usize;
+        let mut n_classes = 0usize;
+        let mut n_attrs = 0usize;
+        let mut n_properties = 0usize;
+        // Count functions/methods using the Function list directly so we
+        // can use n_params (accurate even for implicit-return dunders).
+        for func in functions.iter().filter(|f| !f.is_property) {
+            if Self::is_method(&func.name, &module_prefix) {
+                n_methods += 1;
+                n_method_params += func.n_params;
+            } else {
+                n_functions += 1;
+                n_function_params += func.n_params;
+            }
+        }
+        for sym in &symbol_reports {
+            match sym {
+                SymbolReport::Property { .. } => n_properties += 1,
+                SymbolReport::Attr { .. } => n_attrs += 1,
+                SymbolReport::Class { .. } => n_classes += 1,
+                SymbolReport::Function { .. } => {}
+            }
+        }
+        let n_type_ignores = suppressions.len();
+
         ModuleReport {
             name,
             names,
@@ -1116,6 +1328,14 @@ impl ReportArgs {
             coverage: total_slots.coverage(),
             strict_coverage: total_slots.strict_coverage(),
             slots: total_slots,
+            n_functions,
+            n_methods,
+            n_function_params,
+            n_method_params,
+            n_classes,
+            n_attrs,
+            n_properties,
+            n_type_ignores,
         }
     }
 
@@ -1123,6 +1343,7 @@ impl ReportArgs {
         files_to_check: Box<dyn Includes>,
         config_finder: ConfigFinder,
         prefer_stubs: bool,
+        module_name_override: Option<String>,
         thread_count: ThreadCount,
     ) -> anyhow::Result<CommandExitStatus> {
         let expanded_file_list = config_finder.checkpoint(files_to_check.files())?;
@@ -1185,13 +1406,26 @@ impl ReportArgs {
             {
                 let line_count = module.lined_buffer().line_index().line_count();
                 let exports = transaction.get_exports(handle);
-                let mut functions = Self::parse_functions(&module, &bindings, &answers, &exports);
-                let mut classes =
-                    Self::parse_classes(&module, &bindings, &answers, transaction, handle);
+                let tco_classes = Self::collect_type_check_only_classes(&bindings);
+                let mut functions =
+                    Self::parse_functions(&module, &bindings, &answers, &exports, &tco_classes);
+                let mut classes = Self::parse_classes(
+                    &module,
+                    &bindings,
+                    &answers,
+                    transaction,
+                    handle,
+                    &tco_classes,
+                );
                 let mut variables = Self::parse_variables(
                     &module, &bindings, &answers, &exports, &functions, &classes,
                 );
-                variables.extend(Self::parse_instance_attrs(&module, &bindings, &answers));
+                variables.extend(Self::parse_instance_attrs(
+                    &module,
+                    &bindings,
+                    &answers,
+                    &tco_classes,
+                ));
                 let suppressions = Self::parse_suppressions(&module);
 
                 // When a .pyi stub shadows a .py file, include uncovered .py symbols.
@@ -1201,14 +1435,21 @@ impl ReportArgs {
                     && let Some(py_answers) = transaction.get_answers(py_handle)
                 {
                     let py_exports = transaction.get_exports(py_handle);
-                    let py_functions =
-                        Self::parse_functions(&py_module, &py_bindings, &py_answers, &py_exports);
+                    let py_tco_classes = Self::collect_type_check_only_classes(&py_bindings);
+                    let py_functions = Self::parse_functions(
+                        &py_module,
+                        &py_bindings,
+                        &py_answers,
+                        &py_exports,
+                        &py_tco_classes,
+                    );
                     let py_classes = Self::parse_classes(
                         &py_module,
                         &py_bindings,
                         &py_answers,
                         transaction,
                         py_handle,
+                        &py_tco_classes,
                     );
                     let mut py_variables = Self::parse_variables(
                         &py_module,
@@ -1222,6 +1463,7 @@ impl ReportArgs {
                         &py_module,
                         &py_bindings,
                         &py_answers,
+                        &py_tco_classes,
                     ));
                     Self::merge_uncovered_py_symbols(
                         &mut functions,
@@ -1233,15 +1475,38 @@ impl ReportArgs {
                     );
                 }
 
-                let name = handle.module().to_string();
-                let module_report = Self::build_module_report(
-                    name,
+                let derived_name = handle.module().to_string();
+                let name = module_name_override.clone().unwrap_or(derived_name.clone());
+                let mut module_report = Self::build_module_report(
+                    name.clone(),
+                    &derived_name,
                     line_count,
                     &functions,
                     &variables,
                     &classes,
                     suppressions,
                 );
+                // When --module overrides the name, rewrite symbol prefixes to match.
+                if module_name_override.is_some() && name != derived_name {
+                    let old_prefix = format!("{}.", derived_name);
+                    let new_prefix = format!("{}.", name);
+                    for n in &mut module_report.names {
+                        if let Some(rest) = n.strip_prefix(&old_prefix) {
+                            *n = format!("{new_prefix}{rest}");
+                        }
+                    }
+                    for sym in &mut module_report.symbol_reports {
+                        let sym_name = match sym {
+                            SymbolReport::Attr { name, .. }
+                            | SymbolReport::Function { name, .. }
+                            | SymbolReport::Class { name, .. }
+                            | SymbolReport::Property { name, .. } => name,
+                        };
+                        if let Some(rest) = sym_name.strip_prefix(&old_prefix) {
+                            *sym_name = format!("{new_prefix}{rest}");
+                        }
+                    }
+                }
                 module_reports.push(module_report);
             }
         }
@@ -1320,25 +1585,64 @@ mod tests {
         let exports = transaction.get_exports(&handle);
 
         let line_count = module.lined_buffer().line_index().line_count();
-        let functions = ReportArgs::parse_functions(&module, &bindings, &answers, &exports);
-        let classes =
-            ReportArgs::parse_classes(&module, &bindings, &answers, &transaction, &handle);
+        let tco_classes = ReportArgs::collect_type_check_only_classes(&bindings);
+        let functions =
+            ReportArgs::parse_functions(&module, &bindings, &answers, &exports, &tco_classes);
+        let classes = ReportArgs::parse_classes(
+            &module,
+            &bindings,
+            &answers,
+            &transaction,
+            &handle,
+            &tco_classes,
+        );
         let mut variables = ReportArgs::parse_variables(
             &module, &bindings, &answers, &exports, &functions, &classes,
         );
         variables.extend(ReportArgs::parse_instance_attrs(
-            &module, &bindings, &answers,
+            &module,
+            &bindings,
+            &answers,
+            &tco_classes,
         ));
         let suppressions = ReportArgs::parse_suppressions(&module);
 
         ReportArgs::build_module_report(
             "test".to_owned(),
+            "test",
             line_count,
             &functions,
             &variables,
             &classes,
             suppressions,
         )
+    }
+
+    /// Build a `ModuleReport` with a module name override, mirroring
+    /// the `run_inner` --module flag logic.
+    fn build_module_report_with_override(py_file: &str, override_name: &str) -> ModuleReport {
+        let mut report = build_module_report_for_test(py_file);
+        let derived_name = "test";
+        let old_prefix = format!("{}.", derived_name);
+        let new_prefix = format!("{}.", override_name);
+        report.name = override_name.to_owned();
+        for n in &mut report.names {
+            if let Some(rest) = n.strip_prefix(&old_prefix) {
+                *n = format!("{new_prefix}{rest}");
+            }
+        }
+        for sym in &mut report.symbol_reports {
+            let sym_name = match sym {
+                SymbolReport::Attr { name, .. }
+                | SymbolReport::Function { name, .. }
+                | SymbolReport::Class { name, .. }
+                | SymbolReport::Property { name, .. } => name,
+            };
+            if let Some(rest) = sym_name.strip_prefix(&old_prefix) {
+                *sym_name = format!("{new_prefix}{rest}");
+            }
+        }
+        report
     }
 
     /// Build a `ModuleReport` that merges a `.pyi` stub with its `.py` source,
@@ -1359,14 +1663,25 @@ mod tests {
         let exports = pyi_txn.get_exports(&pyi_handle);
 
         let line_count = module.lined_buffer().line_index().line_count();
-        let mut functions = ReportArgs::parse_functions(&module, &bindings, &answers, &exports);
-        let mut classes =
-            ReportArgs::parse_classes(&module, &bindings, &answers, &pyi_txn, &pyi_handle);
+        let tco_classes = ReportArgs::collect_type_check_only_classes(&bindings);
+        let mut functions =
+            ReportArgs::parse_functions(&module, &bindings, &answers, &exports, &tco_classes);
+        let mut classes = ReportArgs::parse_classes(
+            &module,
+            &bindings,
+            &answers,
+            &pyi_txn,
+            &pyi_handle,
+            &tco_classes,
+        );
         let mut variables = ReportArgs::parse_variables(
             &module, &bindings, &answers, &exports, &functions, &classes,
         );
         variables.extend(ReportArgs::parse_instance_attrs(
-            &module, &bindings, &answers,
+            &module,
+            &bindings,
+            &answers,
+            &tco_classes,
         ));
         let suppressions = ReportArgs::parse_suppressions(&module);
 
@@ -1383,10 +1698,22 @@ mod tests {
         let py_answers = py_txn.get_answers(&py_handle).unwrap();
         let py_exports = py_txn.get_exports(&py_handle);
 
-        let py_functions =
-            ReportArgs::parse_functions(&py_module, &py_bindings, &py_answers, &py_exports);
-        let py_classes =
-            ReportArgs::parse_classes(&py_module, &py_bindings, &py_answers, &py_txn, &py_handle);
+        let py_tco_classes = ReportArgs::collect_type_check_only_classes(&py_bindings);
+        let py_functions = ReportArgs::parse_functions(
+            &py_module,
+            &py_bindings,
+            &py_answers,
+            &py_exports,
+            &py_tco_classes,
+        );
+        let py_classes = ReportArgs::parse_classes(
+            &py_module,
+            &py_bindings,
+            &py_answers,
+            &py_txn,
+            &py_handle,
+            &py_tco_classes,
+        );
         let mut py_variables = ReportArgs::parse_variables(
             &py_module,
             &py_bindings,
@@ -1399,6 +1726,7 @@ mod tests {
             &py_module,
             &py_bindings,
             &py_answers,
+            &py_tco_classes,
         ));
 
         // Merge uncovered symbols from .py into the stub report
@@ -1413,6 +1741,7 @@ mod tests {
 
         ReportArgs::build_module_report(
             "test".to_owned(),
+            "test",
             line_count,
             &functions,
             &variables,
@@ -1584,6 +1913,7 @@ mod tests {
                     .collect(),
                 is_type_known: false, // Not relevant for annotation-only tests
                 is_property: false,
+                n_params: 0,
                 slots: SlotCounts::default(),
                 location: Location { line: 1, column: 1 },
             }
@@ -1685,12 +2015,8 @@ mod tests {
 
     /// @overload decorated functions and methods.
     ///
-    /// Deliberate divergence from typestats: pyrefly emits each @overload
-    /// signature as a separate SymbolReport, giving per-signature coverage
-    /// granularity. Typestats merges overloads into a single FunctionReport
-    /// using worst-annotation-wins deduplication (positional by index, named
-    /// by name, variadic as singletons). Typestats can post-process pyrefly's
-    /// output to merge if needed; we keep the richer representation here.
+    /// Only the @overload signatures are reported; the implementation
+    /// signature is excluded because it is not part of the public API.
     #[test]
     fn test_report_overloads() {
         let report = build_module_report_for_test("overloads.py");
@@ -1723,6 +2049,23 @@ mod tests {
         compare_snapshot("dunder_implicit.expected.json", &report);
     }
 
+    /// Dunder methods with implicit parameter types (__exit__ exception triple,
+    /// __getattr__ name, __setattr__ name). Unannotated implicit params get 0 slots;
+    /// explicit annotations on implicit params count normally.
+    #[test]
+    fn test_report_dunder_params() {
+        let report = build_module_report_for_test("dunder_params.py");
+        compare_snapshot("dunder_params.expected.json", &report);
+    }
+
+    /// Class-body dunder attrs (__slots__, __doc__, __module__, etc.) are
+    /// excluded from coverage counting — their types are implicit.
+    #[test]
+    fn test_report_dunder_attrs() {
+        let report = build_module_report_for_test("dunder_attrs.py");
+        compare_snapshot("dunder_attrs.expected.json", &report);
+    }
+
     /// Protocol classes define structural interfaces. The class itself should
     /// have n_typable=0, while its methods still count toward coverage.
     #[test]
@@ -1739,6 +2082,14 @@ mod tests {
         compare_snapshot("decorators.expected.json", &report);
     }
 
+    /// @type_check_only exclusion: decorated functions and classes are
+    /// entirely excluded from the report.
+    #[test]
+    fn test_report_type_check_only() {
+        let report = build_module_report_for_test("type_check_only.py");
+        compare_snapshot("type_check_only.expected.json", &report);
+    }
+
     /// Class method aliases: __rand__ = __and__.
     /// Current: aliases are not reported (only the original method def).
     /// Typestats: method aliases are copied as Function symbols.
@@ -1746,5 +2097,20 @@ mod tests {
     fn test_report_method_aliases() {
         let report = build_module_report_for_test("method_aliases.py");
         compare_snapshot("method_aliases.expected.json", &report);
+    }
+
+    /// Non-public names and excluded module dunders are filtered from the report.
+    #[test]
+    fn test_report_private_filtering() {
+        let report = build_module_report_for_test("private_filtering.py");
+        compare_snapshot("private_filtering.expected.json", &report);
+    }
+
+    /// --module name override: entity counts (n_functions vs n_methods) must
+    /// be correct even when the output module name differs from the derived name.
+    #[test]
+    fn test_report_module_name_override() {
+        let report = build_module_report_with_override("functions.py", "my.package.module");
+        compare_snapshot("module_name_override.expected.json", &report);
     }
 }
