@@ -6,6 +6,7 @@
  */
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -19,6 +20,7 @@ use pyrefly_python::ignore::Ignore;
 use pyrefly_python::ignore::Tool;
 use pyrefly_python::module::Module;
 use pyrefly_python::module_name::ModuleName;
+use pyrefly_python::module_path::ModuleStyle;
 use pyrefly_python::nesting_context::NestingContext;
 use pyrefly_python::short_identifier::ShortIdentifier;
 use pyrefly_types::callable::PropertyRole;
@@ -33,6 +35,7 @@ use ruff_python_ast::name::Name;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use serde::Serialize;
+use starlark_map::Hashed;
 use starlark_map::small_map::SmallMap;
 use starlark_map::small_set::SmallSet;
 
@@ -62,12 +65,14 @@ use crate::commands::config_finder::ConfigConfigurerWrapper;
 use crate::commands::files::FilesArgs;
 use crate::commands::util::CommandExitStatus;
 use crate::export::exports::ExportLocation;
+use crate::module::finder::DirEntryCache;
+use crate::module::finder::find_import_filtered;
 use crate::state::require::Require;
 use crate::state::state::State;
 use crate::state::state::Transaction;
 
 /// `(major, minor)` version for the report JSON schema.
-const REPORT_SCHEMA_VERSION: (u32, u32) = (0, 1);
+const REPORT_SCHEMA_VERSION: (u32, u32) = (0, 2);
 
 /// Slot-level annotation counts for a symbol.
 ///
@@ -144,14 +149,14 @@ impl SlotCounts {
     }
 }
 
-/// Annotation quality for a single slot, ordered worst-to-best so that
-/// `min()` gives "worst-wins" semantics.
+/// Annotation quality for a single slot, ordered so that `max()` gives "best-wins" semantics across
+/// overloads. `Skip` is the neutral element.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SlotRank {
+    Skip,
     Untyped,
     Any,
     Typed,
-    Skip,
 }
 
 impl SlotRank {
@@ -273,6 +278,8 @@ enum SymbolReport {
         name: String,
         #[serde(flatten)]
         slots: SlotCounts,
+        #[serde(skip)]
+        n_params: usize,
         location: Location,
     },
     #[serde(rename = "class")]
@@ -291,10 +298,41 @@ enum SymbolReport {
     },
 }
 
+impl SymbolReport {
+    fn name(&self) -> &str {
+        match self {
+            Self::Attr { name, .. }
+            | Self::Function { name, .. }
+            | Self::Class { name, .. }
+            | Self::Property { name, .. } => name,
+        }
+    }
+
+    fn name_mut(&mut self) -> &mut String {
+        match self {
+            Self::Attr { name, .. }
+            | Self::Function { name, .. }
+            | Self::Class { name, .. }
+            | Self::Property { name, .. } => name,
+        }
+    }
+
+    fn slots(&self) -> &SlotCounts {
+        match self {
+            Self::Attr { slots, .. }
+            | Self::Function { slots, .. }
+            | Self::Class { slots, .. }
+            | Self::Property { slots, .. } => slots,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ModuleReport {
     /// Fully-qualified module name (e.g. "mypackage.submodule").
     name: String,
+    /// Filesystem path to the module source file.
+    path: String,
     /// Names of symbols defined in this module.
     names: Vec<String>,
     line_count: usize,
@@ -361,6 +399,10 @@ pub struct ReportArgs {
     /// from its filesystem layout.
     #[clap(long)]
     module: Option<String>,
+
+    /// Only report symbols reachable from public modules via re-export chains.
+    #[clap(long)]
+    public_only: bool,
 }
 
 impl ReportArgs {
@@ -370,12 +412,19 @@ impl ReportArgs {
         thread_count: ThreadCount,
     ) -> anyhow::Result<CommandExitStatus> {
         self.config_override.validate()?;
-        let (files_to_check, config_finder) = self.files.resolve(self.config_override, wrapper)?;
+
+        if self.public_only && self.module.is_some() {
+            anyhow::bail!("--module and --public-only cannot be combined");
+        }
+
+        let (files_to_check, config_finder, _) =
+            self.files.resolve(self.config_override, wrapper)?;
         Self::run_inner(
             files_to_check,
             config_finder,
             self.prefer_stubs,
             self.module,
+            self.public_only,
             thread_count,
         )
     }
@@ -478,7 +527,7 @@ impl ReportArgs {
     }
 
     /// Merge overloads with the same qualified name into one entry,
-    /// keeping the worst annotation quality per deduplicated slot.
+    /// keeping the best annotation quality per deduplicated slot.
     fn merge_overloads(functions: &mut Vec<Function>) {
         let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, func) in functions.iter().enumerate() {
@@ -501,12 +550,12 @@ impl ReportArgs {
                 } else {
                     SlotRank::classify(has_annotation, func.is_return_type_known)
                 };
-                return_rank = return_rank.min(ret);
+                return_rank = return_rank.max(ret);
 
                 for param in &func.parameters {
                     if let Some(key) = &param.merge_key {
                         let entry = param_slots.entry(key.clone()).or_insert(SlotRank::Skip);
-                        *entry = (*entry).min(param.into());
+                        *entry = (*entry).max(param.into());
                     }
                 }
             }
@@ -537,15 +586,164 @@ impl ReportArgs {
         }
     }
 
+    /// Classify an annotation slot from resolver output. Bare qualifiers
+    /// (e.g. `Final`) have unresolved annotation types but still count as typed.
+    fn classify_annotation_rank(has_annotation: bool, resolved_is_known: Option<bool>) -> SlotRank {
+        match resolved_is_known {
+            Some(is_known) => SlotRank::classify(true, is_known),
+            None if has_annotation => SlotRank::Typed,
+            None => SlotRank::Untyped,
+        }
+    }
+
     /// Returns true if the name is public: does not start with `_`, or is a dunder (`__x__`).
     /// Matches typestats `is_public_name`.
     fn is_public_name(name: &str) -> bool {
         !name.starts_with('_') || name.ends_with("__")
     }
 
+    /// A module is public when every dotted-path component is public.
+    fn is_public_module(module: ModuleName) -> bool {
+        module.as_str().split('.').all(Self::is_public_name)
+    }
+
+    /// True if `fqn` or a class-level prefix is public, and every segment below the module is
+    /// itself a public name (no private nested leaks).
+    fn is_public_fqn(fqn: &str, module_prefix: &str, public_fqns: &HashSet<String>) -> bool {
+        if let Some(relative) = fqn.strip_prefix(module_prefix)
+            && !relative.split('.').all(Self::is_public_name)
+        {
+            return false;
+        }
+
+        public_fqns.contains(fqn)
+            || std::iter::successors(fqn.rsplit_once('.').map(|(prefix, _)| prefix), |prefix| {
+                prefix.rsplit_once('.').map(|(parent, _)| parent)
+            })
+            .take_while(|prefix| prefix.starts_with(module_prefix))
+            .any(|prefix| public_fqns.contains(prefix))
+    }
+
     /// Module-level dunders that typestats always excludes from the report.
     const EXCLUDED_MODULE_DUNDERS: &'static [&'static str] =
         &["__all__", "__dir__", "__doc__", "__getattr__"];
+
+    /// Walk re-exports to the defining module's FQN, `None` on cycle/miss.
+    fn trace_export_origin(
+        handle: &Handle,
+        mut cur_name: Name,
+        transaction: &Transaction,
+    ) -> Option<String> {
+        let mut seen = SmallSet::new();
+        let mut cur_handle = handle.clone();
+
+        loop {
+            let module_name = cur_handle.module();
+            if !seen.insert((module_name, cur_name.clone())) {
+                return None;
+            }
+
+            match transaction.get_exports(&cur_handle).get(&cur_name) {
+                Some(ExportLocation::ThisModule(_)) | None => {
+                    return Some(format!("{module_name}.{cur_name}"));
+                }
+                Some(ExportLocation::OtherModule(other_module, alias)) => {
+                    if let Some(alias) = alias {
+                        cur_name = alias.clone();
+                    }
+                    cur_handle = transaction
+                        .import_handle(&cur_handle, *other_module, None)
+                        .finding()?;
+                }
+            }
+        }
+    }
+
+    /// Collect origin FQNs of all publicly exported names across public modules.
+    fn compute_public_fqns(handles: &[Handle], transaction: &Transaction) -> HashSet<String> {
+        handles
+            .iter()
+            .filter(|h| Self::is_public_module(h.module()))
+            .flat_map(|handle| {
+                let exports_data = transaction.get_exports_data(handle);
+                let exports = transaction.get_exports(handle);
+
+                // prioritize `__all__` if present, otherwise local defs + `import x as x`
+                let names: Vec<Name> =
+                    if let Some(all_iter) = exports_data.get_explicit_dunder_all_names_iter() {
+                        all_iter.cloned().collect()
+                    } else {
+                        exports
+                            .iter()
+                            .filter_map(|(name, loc)| {
+                                let is_local = matches!(loc, ExportLocation::ThisModule(_));
+                                let is_reexport = exports_data.is_explicit_reexport(name);
+                                (Self::is_public_name(name.as_str()) && (is_local || is_reexport))
+                                    .then_some(name.clone())
+                            })
+                            .collect()
+                    };
+
+                // emit both the local FQN and the traced origin FQN so a file-scoped run matches
+                // whichever module was requested
+                names
+                    .into_iter()
+                    .filter(|n| !Self::EXCLUDED_MODULE_DUNDERS.contains(&n.as_str()))
+                    .flat_map(move |name| {
+                        let local = format!("{}.{}", handle.module(), name);
+                        let origin = Self::trace_export_origin(handle, name, transaction);
+                        std::iter::once(local).chain(origin)
+                    })
+            })
+            .collect()
+    }
+
+    /// Retain only publicly reachable symbols and recalculate aggregates.
+    fn filter_module_report_to_public(report: &mut ModuleReport, public_fqns: &HashSet<String>) {
+        let module_prefix = format!("{}.", report.name);
+
+        report
+            .symbol_reports
+            .retain(|sym| Self::is_public_fqn(sym.name(), &module_prefix, public_fqns));
+        report
+            .names
+            .retain(|n| Self::is_public_fqn(n, &module_prefix, public_fqns));
+
+        // recompute all aggregates in a single pass
+        report.slots = SlotCounts::default();
+        report.n_methods = 0;
+        report.n_functions = 0;
+        report.n_method_params = 0;
+        report.n_function_params = 0;
+        report.n_classes = 0;
+        report.n_attrs = 0;
+        report.n_properties = 0;
+        // `n_type_ignores` is not affected by public filtering since type ignores are always
+        // attached to the module itself, not individual symbols, so we don't need to recalculate
+        // it here.
+
+        for sym in &report.symbol_reports {
+            report.slots = report.slots.merge(*sym.slots());
+            match sym {
+                SymbolReport::Function { name, n_params, .. }
+                    if Self::is_method(name, &module_prefix) =>
+                {
+                    report.n_methods += 1;
+                    report.n_method_params += *n_params;
+                }
+                SymbolReport::Function { n_params, .. } => {
+                    report.n_functions += 1;
+                    report.n_function_params += *n_params;
+                }
+                SymbolReport::Class { .. } => report.n_classes += 1,
+                SymbolReport::Attr { .. } => report.n_attrs += 1,
+                SymbolReport::Property { .. } => report.n_properties += 1,
+            }
+        }
+
+        report.coverage = report.slots.coverage();
+        report.strict_coverage = report.slots.strict_coverage();
+    }
 
     /// True if the first parameter is the implicit receiver (`self`/`cls`),
     /// excluded from slot counting. `__new__` is a staticmethod but still takes cls.
@@ -563,8 +761,12 @@ impl ReportArgs {
     }
 
     /// Returns the ClassBinding if the class owning this field is a schema class (dataclass, enum,
-    /// TypedDict, or NamedTuple). Fields of schema classes are IMPLICIT — they have
-    /// 0 typable slots because the class definition itself governs their types.
+    /// TypedDict, NamedTuple, pydantic model, or attrs class). Fields of schema classes are
+    /// IMPLICIT — they have 0 typable slots because the class definition itself governs their types.
+    ///
+    /// Only frameworks where annotations are structurally required are included.
+    /// Django, marshmallow, and factory_boy use descriptors with optional annotations,
+    /// so their fields count toward coverage.
     fn get_cls_binding_if_schema_class_field<'a>(
         bindings: &'a Bindings,
         answers: &Answers,
@@ -580,6 +782,8 @@ impl ReportArgs {
             || metadata.is_enum()
             || metadata.is_typed_dict()
             || metadata.named_tuple_metadata().is_some()
+            || metadata.is_pydantic_model()
+            || metadata.is_attrs_class()
         {
             Some(cls_binding)
         } else {
@@ -648,12 +852,12 @@ impl ReportArgs {
                         }
                         _ => None,
                     };
-                    let is_type_known = annotation_text.is_some()
-                        && answers
-                            .get_idx(*annot_idx)
-                            .and_then(|awt| awt.annotation.ty.as_ref().map(Self::is_type_known))
-                            .unwrap_or(false);
-                    let slots = SlotRank::classify(annotation_text.is_some(), is_type_known).into();
+                    let resolved_ty = answers
+                        .get_idx(*annot_idx)
+                        .and_then(|awt| awt.annotation.ty.as_ref().map(Self::is_type_known));
+                    let slots =
+                        Self::classify_annotation_rank(annotation_text.is_some(), resolved_ty)
+                            .into();
                     variables.push(Variable {
                         name: qualified_name,
                         annotation: annotation_text,
@@ -708,7 +912,7 @@ impl ReportArgs {
                 }
             }
         }
-        variables.sort_by(|a, b| a.location.cmp(&b.location));
+        variables.sort_by_key(|a| a.location);
         variables
     }
 
@@ -771,14 +975,13 @@ impl ReportArgs {
                     annotation,
                     initialized_in_recognized_method,
                 } => {
-                    if !initialized_in_recognized_method {
-                        // Check if this is a schema class body field
-                        if let Some(cls_binding) =
-                            Self::get_cls_binding_if_schema_class_field(bindings, answers, field)
-                        {
-                            if Self::has_function_ancestor(&cls_binding.parent) {
-                                continue;
-                            }
+                    // Schema class fields are always IMPLICIT regardless of whether they're
+                    // also initialized in a recognized method — the class definition governs
+                    // their types.
+                    if let Some(cls_binding) =
+                        Self::get_cls_binding_if_schema_class_field(bindings, answers, field)
+                    {
+                        if !Self::has_function_ancestor(&cls_binding.parent) {
                             let class_name = Self::class_qualified_name(
                                 module,
                                 &cls_binding.parent,
@@ -794,6 +997,10 @@ impl ReportArgs {
                                 location,
                             });
                         }
+                        continue;
+                    }
+                    // Non-schema fields only count when initialized in a recognized method.
+                    if !initialized_in_recognized_method {
                         continue;
                     }
                     Some(*annotation)
@@ -844,15 +1051,13 @@ impl ReportArgs {
                 }
                 _ => None,
             });
-            let is_type_known = annotation_text.is_some()
-                && annotation_idx
-                    .and_then(|idx| {
-                        answers
-                            .get_idx(idx)
-                            .and_then(|awt| awt.annotation.ty.as_ref().map(Self::is_type_known))
-                    })
-                    .unwrap_or(false);
-            let slots = SlotRank::classify(annotation_text.is_some(), is_type_known).into();
+            let resolved_ty = annotation_idx.and_then(|idx| {
+                answers
+                    .get_idx(idx)
+                    .and_then(|awt| awt.annotation.ty.as_ref().map(Self::is_type_known))
+            });
+            let slots =
+                Self::classify_annotation_rank(annotation_text.is_some(), resolved_ty).into();
 
             attrs.push(Variable {
                 name: qualified_name,
@@ -861,7 +1066,7 @@ impl ReportArgs {
                 location,
             });
         }
-        attrs.sort_by(|a, b| a.location.cmp(&b.location));
+        attrs.sort_by_key(|a| a.location);
         attrs
     }
 
@@ -887,6 +1092,11 @@ impl ReportArgs {
                 let fun = bindings.get(decorated.undecorated_idx);
                 // Skip @type_check_only decorated functions.
                 if Self::has_type_check_only_decorator(&fun.decorators, bindings) {
+                    continue;
+                }
+                // Skip @no_type_check decorated functions — their bodies are
+                // not analyzed, so coverage metrics are meaningless.
+                if Self::has_no_type_check_decorator(&fun.decorators, bindings) {
                     continue;
                 }
                 // Skip methods of @type_check_only decorated classes.
@@ -956,10 +1166,14 @@ impl ReportArgs {
                     None
                 };
 
-                let is_return_type_known = return_annotation.is_some()
-                    && answers
+                let resolved_return_ty = return_annotation.as_ref().and_then(|_| {
+                    answers
                         .get_type_at(return_idx)
-                        .is_some_and(|t| Self::is_type_known(&t));
+                        .map(|t| Self::is_type_known(&t))
+                });
+                let is_return_type_known =
+                    Self::classify_annotation_rank(return_annotation.is_some(), resolved_return_ty)
+                        == SlotRank::Typed;
 
                 let mut parameters = Vec::new();
                 let implicit_receiver =
@@ -1002,19 +1216,24 @@ impl ReportArgs {
                         .as_ref()
                         .map(|ann| module.code_at(ann.range()).to_owned());
 
-                    let is_param_type_known = if is_self {
-                        true
-                    } else if param.annotation.is_some() {
+                    let resolved_param_ty = if param.annotation.is_some() {
                         let annot_key =
                             KeyAnnotation::Annotation(ShortIdentifier::new(&param.name));
-                        let annot_idx = bindings.key_to_idx(&annot_key);
-                        answers
-                            .get_idx(annot_idx)
+                        // Use fallible lookup to handle @no_type_check functions gracefully.
+                        // The binding pass skips creating KeyAnnotation entries for parameters
+                        // of @no_type_check functions since their bodies are not analyzed.
+                        bindings
+                            .key_to_idx_hashed_opt(Hashed::new(&annot_key))
+                            .and_then(|annot_idx| answers.get_idx(annot_idx))
                             .and_then(|awt| awt.annotation.ty.as_ref().map(Self::is_type_known))
-                            .unwrap_or(false)
                     } else {
-                        false
+                        None
                     };
+                    let is_param_type_known = is_self
+                        || Self::classify_annotation_rank(
+                            param_annotation.is_some(),
+                            resolved_param_ty,
+                        ) == SlotRank::Typed;
 
                     // Implicit dunder params are always excluded, even when annotated.
                     let is_implicit_param = !is_self
@@ -1230,13 +1449,13 @@ impl ReportArgs {
         )
     }
 
-    /// Check whether a decorator expression matches `type_check_only`.
-    /// Handles `@type_check_only`, `@typing.type_check_only`, and call forms.
-    fn is_type_check_only_expr(expr: &Expr) -> bool {
+    /// Check whether a decorator expression matches the given name.
+    /// Handles `@name`, `@module.name`, and call forms like `@name(...)`.
+    fn is_decorator_named(expr: &Expr, name: &str) -> bool {
         match expr {
-            Expr::Name(name) => name.id.as_str() == "type_check_only",
-            Expr::Attribute(attr) => attr.attr.as_str() == "type_check_only",
-            Expr::Call(call) => Self::is_type_check_only_expr(&call.func),
+            Expr::Name(n) => n.id.as_str() == name,
+            Expr::Attribute(attr) => attr.attr.as_str() == name,
+            Expr::Call(call) => Self::is_decorator_named(&call.func, name),
             _ => false,
         }
     }
@@ -1246,9 +1465,23 @@ impl ReportArgs {
         decorators: &[Idx<KeyDecorator>],
         bindings: &Bindings,
     ) -> bool {
+        Self::has_decorator_named(decorators, bindings, "type_check_only")
+    }
+
+    /// Check if any decorator in the list is `@no_type_check`.
+    fn has_no_type_check_decorator(decorators: &[Idx<KeyDecorator>], bindings: &Bindings) -> bool {
+        Self::has_decorator_named(decorators, bindings, "no_type_check")
+    }
+
+    /// Check if any decorator in the list matches the given name.
+    fn has_decorator_named(
+        decorators: &[Idx<KeyDecorator>],
+        bindings: &Bindings,
+        name: &str,
+    ) -> bool {
         decorators.iter().any(|&dec_idx| {
             let decorator = bindings.get(dec_idx);
-            Self::is_type_check_only_expr(&decorator.expr)
+            Self::is_decorator_named(&decorator.expr, name)
         })
     }
 
@@ -1495,6 +1728,7 @@ impl ReportArgs {
 
     fn build_module_report(
         name: String,
+        path: String,
         derived_name: &str,
         line_count: usize,
         functions: &[Function],
@@ -1531,6 +1765,7 @@ impl ReportArgs {
                 symbol_reports.push(SymbolReport::Function {
                     name: func.name.clone(),
                     slots: func.slots,
+                    n_params: func.n_params,
                     location: func.location,
                 });
             }
@@ -1592,6 +1827,7 @@ impl ReportArgs {
 
         ModuleReport {
             name,
+            path,
             names,
             line_count,
             symbol_reports,
@@ -1615,6 +1851,7 @@ impl ReportArgs {
         config_finder: ConfigFinder,
         prefer_stubs: bool,
         module_name_override: Option<String>,
+        public_only: bool,
         thread_count: ThreadCount,
     ) -> anyhow::Result<CommandExitStatus> {
         let expanded_file_list = config_finder.checkpoint(files_to_check.files())?;
@@ -1645,24 +1882,54 @@ impl ReportArgs {
             SmallSet::new()
         };
 
-        // When prefer_stubs is true, build a mapping from .pyi paths to their
-        // corresponding .py handles.
-        let pyi_to_py: HashMap<PathBuf, &Handle> = if prefer_stubs {
+        // Map each .pyi to its corresponding .py: first co-located,
+        // then by module-name lookup in site-package-path.
+        let pyi_to_py: HashMap<PathBuf, Handle> = if prefer_stubs {
             let py_by_path: HashMap<PathBuf, &Handle> = handles
                 .iter()
                 .filter(|h| !h.path().is_interface())
                 .map(|h| (h.path().as_path().to_path_buf(), h))
                 .collect();
-            handles
+            let mut map: HashMap<PathBuf, Handle> = handles
                 .iter()
                 .filter(|h| h.path().is_interface())
                 .filter_map(|h| {
                     let py_path = h.path().as_path().with_extension("py");
                     py_by_path
                         .get(&py_path)
-                        .map(|&py_h| (h.path().as_path().to_path_buf(), py_h))
+                        .map(|&py_h| (h.path().as_path().to_path_buf(), py_h.clone()))
                 })
-                .collect()
+                .collect();
+            // Fall back to site-package-path for stubs-only packages.
+            let mut external_handles = Vec::new();
+            for h in handles.iter().filter(|h| h.path().is_interface()) {
+                let pyi_path = h.path().as_path().to_path_buf();
+                if map.contains_key(&pyi_path) {
+                    continue;
+                }
+                let config = holder
+                    .as_ref()
+                    .config_finder()
+                    .python_file(h.module_kind(), h.path());
+                if let Some(py_module_path) = find_import_filtered(
+                    &config,
+                    h.module(),
+                    None,
+                    Some(ModuleStyle::Executable),
+                    &DirEntryCache::new(true),
+                    None,
+                )
+                .finding()
+                {
+                    let py_handle = config.handle_from_module_path(py_module_path);
+                    external_handles.push(py_handle.clone());
+                    map.insert(pyi_path, py_handle);
+                }
+            }
+            if !external_handles.is_empty() {
+                transaction.run(&external_handles, Require::Everything, None);
+            }
+            map
         } else {
             HashMap::new()
         };
@@ -1750,8 +2017,10 @@ impl ReportArgs {
 
                 let derived_name = handle.module().to_string();
                 let name = module_name_override.clone().unwrap_or(derived_name.clone());
+                let path = handle.path().as_path().display().to_string();
                 let mut module_report = Self::build_module_report(
                     name.clone(),
+                    path,
                     &derived_name,
                     line_count,
                     &functions,
@@ -1769,12 +2038,7 @@ impl ReportArgs {
                         }
                     }
                     for sym in &mut module_report.symbol_reports {
-                        let sym_name = match sym {
-                            SymbolReport::Attr { name, .. }
-                            | SymbolReport::Function { name, .. }
-                            | SymbolReport::Class { name, .. }
-                            | SymbolReport::Property { name, .. } => name,
-                        };
+                        let sym_name = sym.name_mut();
                         if let Some(rest) = sym_name.strip_prefix(&old_prefix) {
                             *sym_name = format!("{new_prefix}{rest}");
                         }
@@ -1782,6 +2046,14 @@ impl ReportArgs {
                 }
                 module_reports.push(module_report);
             }
+        }
+
+        if public_only {
+            let public_fqns = Self::compute_public_fqns(&handles, transaction);
+            for report in &mut module_reports {
+                Self::filter_module_report_to_public(report, &public_fqns);
+            }
+            module_reports.retain(|r| !r.symbol_reports.is_empty());
         }
 
         let summary = Self::calculate_summary(&module_reports);
@@ -1799,6 +2071,7 @@ impl ReportArgs {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::path::PathBuf;
 
     use dupe::Dupe;
@@ -1843,11 +2116,12 @@ mod tests {
         );
     }
 
-    /// Build a `ModuleReport` from a checked-in Python test file,
+    /// Build a `ModuleReport` from a checked-in Python test file using a custom `TestEnv`,
     /// mirroring the production pipeline in `run_inner`.
-    fn build_module_report_for_test(py_file: &str) -> ModuleReport {
+    fn build_module_report_for_test_with_env(py_file: &str, mut env: TestEnv) -> ModuleReport {
         let code = load_test_file(py_file);
-        let (state, handle_fn) = TestEnv::one("test", &code)
+        env.add("test", &code);
+        let (state, handle_fn) = env
             .with_default_require_level(Require::Everything)
             .to_state();
         let handle = handle_fn("test");
@@ -1884,6 +2158,7 @@ mod tests {
 
         ReportArgs::build_module_report(
             "test".to_owned(),
+            "test.py".to_owned(),
             "test",
             line_count,
             &functions,
@@ -1891,6 +2166,12 @@ mod tests {
             &classes,
             suppressions,
         )
+    }
+
+    /// Build a `ModuleReport` from a checked-in Python test file,
+    /// mirroring the production pipeline in `run_inner`.
+    fn build_module_report_for_test(py_file: &str) -> ModuleReport {
+        build_module_report_for_test_with_env(py_file, TestEnv::new())
     }
 
     /// Build a `ModuleReport` with a module name override, mirroring
@@ -1907,12 +2188,7 @@ mod tests {
             }
         }
         for sym in &mut report.symbol_reports {
-            let sym_name = match sym {
-                SymbolReport::Attr { name, .. }
-                | SymbolReport::Function { name, .. }
-                | SymbolReport::Class { name, .. }
-                | SymbolReport::Property { name, .. } => name,
-            };
+            let sym_name = sym.name_mut();
             if let Some(rest) = sym_name.strip_prefix(&old_prefix) {
                 *sym_name = format!("{new_prefix}{rest}");
             }
@@ -2018,6 +2294,7 @@ mod tests {
 
         ReportArgs::build_module_report(
             "test".to_owned(),
+            "test.pyi".to_owned(),
             "test",
             line_count,
             &functions,
@@ -2073,6 +2350,37 @@ mod tests {
     /// the uncovered symbols appear as unannotated and reduce completeness.
     #[test]
     fn test_report_partial_stub() {
+        let report = build_stub_module_report("partial_stub.pyi", "partial_stub.py");
+        compare_snapshot("partial_stub.expected.json", &report);
+    }
+
+    /// Stubs-only packages: .py discovered via site-package-path, merged like co-located stubs.
+    #[test]
+    fn test_report_external_stub_merge() {
+        use pyrefly_config::config::ConfigFile;
+
+        let site_dir = tempfile::TempDir::new().unwrap();
+        let py_code = load_test_file("partial_stub.py");
+        std::fs::write(site_dir.path().join("test.py"), &py_code).unwrap();
+
+        let mut config = ConfigFile::default();
+        config.python_environment.site_package_path = Some(vec![site_dir.path().to_path_buf()]);
+        config.interpreters.skip_interpreter_query = true;
+        config.configure();
+
+        let py_module_path = find_import_filtered(
+            &config,
+            ModuleName::from_str("test"),
+            None,
+            Some(ModuleStyle::Executable),
+            &DirEntryCache::new(true),
+            None,
+        )
+        .finding()
+        .expect("should discover test.py in site-packages");
+        assert_eq!(py_module_path.as_path(), site_dir.path().join("test.py"));
+
+        // the merge should produce the same report as the co-located case
         let report = build_stub_module_report("partial_stub.pyi", "partial_stub.py");
         compare_snapshot("partial_stub.expected.json", &report);
     }
@@ -2326,6 +2634,15 @@ mod tests {
         compare_snapshot("overloads_partial.expected.json", &report);
     }
 
+    /// @overload merging with a fallback returning `Any`.
+    /// Best-wins semantics mean the merged return is `Typed`, not `Any`.
+    /// Regression test for https://github.com/facebook/pyrefly/issues/3257.
+    #[test]
+    fn test_report_overloads_any_fallback() {
+        let report = build_module_report_for_test("overloads_any_fallback.py");
+        compare_snapshot("overloads_any_fallback.expected.json", &report);
+    }
+
     /// @dataclass, Enum, TypedDict, NamedTuple: schema class fields.
     /// Current: schema class fields are reported as regular variables.
     /// Typestats: schema fields are IMPLICIT (0 typable).
@@ -2431,6 +2748,54 @@ mod tests {
         compare_snapshot("partial_any.expected.json", &report);
     }
 
+    /// Bare `Final` should be typed, not `Any`
+    #[test]
+    fn test_report_bare_final() {
+        let report = build_module_report_for_test("bare_final.py");
+        let attr_slots = |name: &str| {
+            report
+                .symbol_reports
+                .iter()
+                .find_map(|s| match s {
+                    SymbolReport::Attr { name: n, slots, .. } if n == name => Some(*slots),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no attr symbol named {name}"))
+        };
+
+        for name in [
+            "test.golden",
+            "test.golden_ratio",
+            "test.pi",
+            "test.name",
+            "test.Constants.rate",
+            "test.Constants.count",
+        ] {
+            let slots = attr_slots(name);
+            assert_eq!(slots.n_typable, 1, "{name} should have 1 typable slot");
+            assert_eq!(slots.n_typed, 1, "{name} should be typed");
+            assert_eq!(slots.n_any, 0, "{name} should not be any");
+        }
+    }
+
+    #[test]
+    fn test_report_bare_list_annotations() {
+        let report = build_module_report_for_test("bare_list_annotations.py");
+        let function_slots = report
+            .symbol_reports
+            .iter()
+            .find_map(|s| match s {
+                SymbolReport::Function { name, slots, .. } if name == "test.f" => Some(*slots),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no function symbol named test.f"));
+
+        assert_eq!(function_slots.n_typable, 2);
+        assert_eq!(function_slots.n_typed, 2);
+        assert_eq!(function_slots.n_any, 0);
+        assert_eq!(function_slots.n_untyped, 0);
+    }
+
     #[test]
     fn test_full_report_has_schema_version() {
         let report = build_module_report_for_test("functions.py");
@@ -2453,5 +2818,282 @@ mod tests {
     fn test_report_type_aliases() {
         let report = build_module_report_for_test("type_aliases.py");
         compare_snapshot("type_aliases.expected.json", &report);
+    }
+
+    /// @no_type_check functions should be excluded from coverage reporting
+    /// entirely, since their bodies are not analyzed.
+    #[test]
+    fn test_report_no_type_check_excluded() {
+        let code = r#"
+from typing import no_type_check
+
+@no_type_check
+def f(x: int):
+    pass
+
+def g(x: int) -> int:
+    return x
+"#;
+        let (state, handle_fn) = TestEnv::one("test", code)
+            .with_default_require_level(Require::Everything)
+            .to_state();
+        let handle = handle_fn("test");
+        let transaction = state.transaction();
+
+        let module = transaction.get_module_info(&handle).unwrap();
+        let bindings = transaction.get_bindings(&handle).unwrap();
+        let answers = transaction.get_answers(&handle).unwrap();
+        let exports = transaction.get_exports(&handle);
+
+        let tco_classes = ReportArgs::collect_type_check_only_classes(&bindings);
+        let functions =
+            ReportArgs::parse_functions(&module, &bindings, &answers, &exports, &tco_classes);
+
+        // Only g should be reported; f is excluded due to @no_type_check.
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[0].name, "test.g");
+    }
+
+    // ──── --public-only tests ────
+
+    #[test]
+    fn test_is_public_module() {
+        let public = |s| ReportArgs::is_public_module(ModuleName::from_str(s));
+        assert!(public("pkg"));
+        assert!(public("pkg.sub"));
+        assert!(!public("pkg._internal"));
+        assert!(!public("_pkg"));
+        assert!(!public("pkg._internal.sub"));
+    }
+
+    #[test]
+    fn test_is_fqn_public() {
+        let fqns: HashSet<String> = ["pkg.Foo", "pkg.bar"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let public = |s| ReportArgs::is_public_fqn(s, "pkg.", &fqns);
+        assert!(public("pkg.Foo"));
+        assert!(public("pkg.bar"));
+        assert!(public("pkg.Foo.method")); // class member of a public class
+        assert!(public("pkg.Foo.Inner.attr"));
+        assert!(!public("other.Foo"));
+        assert!(!public("pkg.Baz"));
+        assert!(!public("pkg.Baz.method"));
+        // Private nested members do not leak through a public parent.
+        assert!(!public("pkg.Foo._private"));
+        assert!(!public("pkg.Foo._Inner.attr"));
+        assert!(!public("pkg._Hidden.Foo"));
+    }
+
+    #[test]
+    fn test_filter_module_report_to_public() {
+        let loc = |line| Location { line, column: 1 };
+        let mut report = ModuleReport {
+            name: "pkg".to_owned(),
+            path: "pkg/__init__.py".to_owned(),
+            names: vec!["pkg.Foo".into(), "pkg.bar".into(), "pkg._private".into()],
+            line_count: 10,
+            symbol_reports: vec![
+                SymbolReport::Class {
+                    name: "pkg.Foo".into(),
+                    slots: SlotCounts::default(),
+                    location: loc(1),
+                },
+                SymbolReport::Function {
+                    name: "pkg.Foo.method".into(),
+                    slots: SlotCounts::typed(),
+                    n_params: 2,
+                    location: loc(2),
+                },
+                SymbolReport::Function {
+                    name: "pkg.bar".into(),
+                    slots: SlotCounts::untyped(),
+                    n_params: 1,
+                    location: loc(3),
+                },
+                SymbolReport::Attr {
+                    name: "pkg._private".into(),
+                    slots: SlotCounts::typed(),
+                    location: loc(4),
+                },
+            ],
+            type_ignores: vec![],
+            slots: SlotCounts::default(),
+            coverage: 100.0,
+            strict_coverage: 100.0,
+            n_functions: 2,
+            n_methods: 0,
+            n_function_params: 123,
+            n_method_params: 456,
+            n_classes: 1,
+            n_attrs: 1,
+            n_properties: 0,
+            n_type_ignores: 0,
+        };
+
+        let public_fqns: HashSet<String> = ["pkg.Foo", "pkg.bar"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        ReportArgs::filter_module_report_to_public(&mut report, &public_fqns);
+
+        assert_eq!(report.names, vec!["pkg.Foo", "pkg.bar"]);
+        assert_eq!(report.symbol_reports.len(), 3); // Foo, Foo.method, bar
+        assert_eq!(report.n_functions, 1);
+        assert_eq!(report.n_methods, 1);
+        assert_eq!(report.n_function_params, 1);
+        assert_eq!(report.n_method_params, 2);
+        assert_eq!(report.n_classes, 1);
+        assert_eq!(report.n_attrs, 0);
+    }
+
+    #[test]
+    fn test_compute_public_fqns() {
+        let compute = |modules: &[(&str, &str, &str)], handle_names: &[&str]| -> HashSet<String> {
+            let mut env = TestEnv::new();
+            for &(name, path, source) in modules {
+                env.add_with_path(name, path, source);
+            }
+            let env = env.with_default_require_level(Require::Everything);
+            let (state, handle_fn) = env.to_state();
+            let transaction = state.transaction();
+            let handles: Vec<_> = handle_names.iter().map(|n| handle_fn(n)).collect();
+            ReportArgs::compute_public_fqns(&handles, &transaction)
+        };
+
+        // Re-export from a private module keeps both the local alias and the
+        // traced origin, so reports covering either module stay non-empty.
+        let fqns = compute(
+            &[
+                (
+                    "pkg",
+                    "pkg/__init__.py",
+                    "from pkg._internal import Foo\n__all__ = [\"Foo\"]\n",
+                ),
+                (
+                    "pkg._internal",
+                    "pkg/_internal.py",
+                    "class Foo:\n    x: int = 1\n",
+                ),
+            ],
+            &["pkg", "pkg._internal"],
+        );
+        assert!(fqns.contains("pkg.Foo"));
+        assert!(fqns.contains("pkg._internal.Foo"));
+
+        // Without __all__, non-underscore local names are exported
+        let fqns = compute(
+            &[(
+                "pkg",
+                "pkg/__init__.py",
+                "def foo() -> int: ...\ndef _private(): ...\n",
+            )],
+            &["pkg"],
+        );
+        assert!(fqns.contains("pkg.foo"));
+        assert!(!fqns.contains("pkg._private"));
+
+        // Regular imports (not `import x as x`) are not re-exports
+        let fqns = compute(
+            &[
+                (
+                    "pkg",
+                    "pkg/__init__.py",
+                    "from pkg._internal import helper\ndef local_fn() -> int: ...\n",
+                ),
+                (
+                    "pkg._internal",
+                    "pkg/_internal.py",
+                    "def helper() -> int: ...\n",
+                ),
+            ],
+            &["pkg", "pkg._internal"],
+        );
+        assert!(fqns.contains("pkg.local_fn"));
+        assert!(!fqns.contains("pkg._internal.helper"));
+
+        // `import x as x` is an implicit re-export when there is no __all__
+        let fqns = compute(
+            &[
+                (
+                    "pkg",
+                    "pkg/__init__.py",
+                    "from pkg._internal import helper as helper\n",
+                ),
+                (
+                    "pkg._internal",
+                    "pkg/_internal.py",
+                    "def helper() -> int: ...\n",
+                ),
+            ],
+            &["pkg", "pkg._internal"],
+        );
+        assert!(fqns.contains("pkg._internal.helper"));
+
+        // __all__ takes precedence over `import x as x`
+        let fqns = compute(
+            &[
+                (
+                    "pkg",
+                    "pkg/__init__.py",
+                    concat!(
+                        "from pkg._internal import foo as foo\n",
+                        "from pkg._internal import bar\n",
+                        "baz: int = 1\n",
+                        "__all__ = [\"bar\"]\n",
+                    ),
+                ),
+                (
+                    "pkg._internal",
+                    "pkg/_internal.py",
+                    "def foo() -> int: ...\ndef bar() -> int: ...\n",
+                ),
+            ],
+            &["pkg", "pkg._internal"],
+        );
+        assert!(fqns.contains("pkg._internal.bar"));
+        assert!(!fqns.contains("pkg._internal.foo"));
+        assert!(!fqns.contains("pkg.baz"));
+    }
+
+    /// Dataclass and NamedTuple fields are IMPLICIT; methods on those classes count normally.
+    #[test]
+    fn test_report_schema_classes_methods() {
+        let report = build_module_report_for_test("schema_classes_methods.py");
+        compare_snapshot("schema_classes_methods.expected.json", &report);
+    }
+
+    /// IntEnum, StrEnum, Flag, IntFlag members are IMPLICIT (0 typable).
+    #[test]
+    fn test_report_schema_classes_enums() {
+        let report = build_module_report_for_test("schema_classes_enums.py");
+        compare_snapshot("schema_classes_enums.expected.json", &report);
+    }
+
+    /// TypedDict and dataclass subclasses: fields of all classes are IMPLICIT.
+    /// Inherited fields appear only under the defining class.
+    #[test]
+    fn test_report_schema_classes_inherited() {
+        let report = build_module_report_for_test("schema_classes_inherited.py");
+        compare_snapshot("schema_classes_inherited.expected.json", &report);
+    }
+
+    /// Pydantic BaseModel fields are IMPLICIT (0 typable).
+    #[test]
+    fn test_report_schema_classes_pydantic() {
+        let path = std::env::var("PYDANTIC_TEST_PATH").expect("PYDANTIC_TEST_PATH must be set");
+        let env = TestEnv::new_with_site_package_paths(&[&path]);
+        let report = build_module_report_for_test_with_env("schema_classes_pydantic.py", env);
+        compare_snapshot("schema_classes_pydantic.expected.json", &report);
+    }
+
+    /// attrs @define and @attr.s(auto_attribs=True) fields are IMPLICIT (0 typable).
+    #[test]
+    fn test_report_schema_classes_attrs() {
+        let path = std::env::var("ATTRS_TEST_PATH").expect("ATTRS_TEST_PATH must be set");
+        let env = TestEnv::new_with_site_package_paths(&[&path]);
+        let report = build_module_report_for_test_with_env("schema_classes_attrs.py", env);
+        compare_snapshot("schema_classes_attrs.expected.json", &report);
     }
 }

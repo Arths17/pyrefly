@@ -29,8 +29,6 @@ use pyrefly_util::visit::Visit;
 use pyrefly_util::visit::VisitMut;
 use ruff_python_ast::Keyword;
 use ruff_python_ast::name::Name;
-use vec1::Vec1;
-use vec1::vec1;
 
 use crate::class::Class;
 use crate::class::ClassType;
@@ -72,6 +70,25 @@ impl Callable {
                     })
             }
             _ => false,
+        }
+    }
+
+    pub fn contains_callable_residual(&self) -> bool {
+        let check = |t: &Type| matches!(t, Type::CallableResidual(_));
+        if self.ret.any(check) {
+            return true;
+        }
+        match &self.params {
+            Params::List(params) => params.items().iter().any(|p| p.as_type().any(check)),
+            Params::ParamSpec(prefix, p) => {
+                prefix.iter().any(|pp| {
+                    let ty = match pp {
+                        PrefixParam::PosOnly(_, ty, _) | PrefixParam::Pos(_, ty, _) => ty,
+                    };
+                    ty.any(check)
+                }) || p.any(check)
+            }
+            Params::Ellipsis | Params::Materialization => false,
         }
     }
 
@@ -428,7 +445,7 @@ impl<To> Visit<To> for DefaultValue
 where
     Type: Visit<To>,
 {
-    const RECURSE_CONTAINS: bool = <Type as Visit<To>>::VISIT_CONTAINS;
+    const RECURSE_CONTAINS: bool = true;
     fn recurse<'a>(&'a self, f: &mut dyn FnMut(&'a To)) {
         self.ty.visit(f);
     }
@@ -438,7 +455,7 @@ impl<To> VisitMut<To> for DefaultValue
 where
     Type: VisitMut<To>,
 {
-    const RECURSE_CONTAINS: bool = <Type as VisitMut<To>>::VISIT_CONTAINS;
+    const RECURSE_CONTAINS: bool = true;
     fn recurse_mut(&mut self, f: &mut dyn FnMut(&mut To)) {
         self.ty.visit_mut(f);
     }
@@ -487,17 +504,21 @@ pub struct FuncMetadata {
 }
 
 impl FuncMetadata {
-    pub fn def(module: Module, cls: Class, func: Name, def_index: Option<FuncDefIndex>) -> Self {
+    pub fn def(module: &Module, cls: Option<&Class>, name: Name) -> Self {
         Self {
             kind: FunctionKind::Def(Arc::new(FuncId {
-                module,
-                cls: Some(cls),
-                name: func,
-                def_index,
+                module: module.dupe(),
+                cls: cls.map(Dupe::dupe),
+                name,
+                def_index: None,
                 outer_funcs: None,
             })),
             flags: FuncFlags::default(),
         }
+    }
+
+    pub fn method(cls: &Class, name: Name) -> Self {
+        Self::def(cls.module(), Some(cls), name)
     }
 }
 
@@ -514,11 +535,11 @@ impl Deprecation {
         Self { message }
     }
 
-    /// Format a base description using deprecation metadata.
-    pub fn as_error_message(&self, base: String) -> Vec1<String> {
+    /// Format deprecation metadata for error reporting.
+    pub fn as_error_detail(&self) -> Option<String> {
         match self.message.as_ref().map(|s| s.trim()) {
-            Some(msg) if !msg.is_empty() => vec1![base, msg.to_owned()],
-            _ => vec1![base],
+            Some(msg) if !msg.is_empty() => Some(msg.to_owned()),
+            _ => None,
         }
     }
 }
@@ -533,6 +554,26 @@ pub enum PropertyRole {
     DeleterDecorator,
 }
 
+/// Shape of a function body that consists of a single placeholder statement.
+/// The two variants share the surface form of "trivial body" but have very
+/// different semantics: `RaiseNotImplementedError` is an "abstract-ish"
+/// placeholder that never returns at runtime, while `ReturnNotImplemented`
+/// returns the singleton `NotImplemented` value (a real runtime value used by
+/// the dunder protocol). The type checker keeps them separate so it can relax
+/// override-consistency only for the abstract-style form, without conflating
+/// it with the dunder-protocol form.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Visit, VisitMut, TypeEq
+)]
+pub enum PlaceholderBodyKind {
+    /// Body is exactly `raise NotImplementedError(...)`. This is the canonical
+    /// "abstract-ish" placeholder; concrete subclasses override it.
+    RaiseNotImplementedError,
+    /// Body is exactly `return NotImplemented`. This is the dunder-protocol
+    /// signal to defer to the other operand and is not an override placeholder.
+    ReturnNotImplemented,
+}
+
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Visit, VisitMut, TypeEq
 )]
@@ -541,6 +582,23 @@ pub struct PropertyMetadata {
     pub getter: Type,
     pub setter: Option<Type>,
     pub has_deleter: bool,
+}
+
+impl PropertyMetadata {
+    /// Build a PropertyMetadata that stores sanitized (metadata-free) copies of getter/setter.
+    pub fn from_components(
+        role: PropertyRole,
+        getter: &Type,
+        setter: Option<&Type>,
+        has_deleter: bool,
+    ) -> Self {
+        Self {
+            role,
+            getter: getter.without_property_metadata(),
+            setter: setter.map(|s| s.without_property_metadata()),
+            has_deleter,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -564,6 +622,24 @@ pub struct FuncFlags {
     pub lacks_implementation: bool,
     /// Is the function definition in a `.pyi` file
     pub defined_in_stub_file: bool,
+    /// Set when the function was declared with `async def` (NOT when a regular
+    /// `def` happens to return a `Coroutine[...]`-typed value). Used to
+    /// distinguish async-def placeholders from sync functions explicitly
+    /// annotated to return a coroutine, which look identical at the type level
+    /// once the async-wrapping into `Coroutine[Any, Any, T]` has happened.
+    pub is_async: bool,
+    /// Set when the function body is a single placeholder statement (see
+    /// `PlaceholderBodyKind`), ignoring a leading docstring. `None` for
+    /// ordinary function bodies, and also for trivial bodies (`pass`, `...`,
+    /// or empty) — those are tracked separately as stubs, not placeholders.
+    pub placeholder_body_kind: Option<PlaceholderBodyKind>,
+    /// Set when the function's return type has no user-supplied annotation and
+    /// was inferred from the body (corresponds to
+    /// `ReturnTypeKind::ShouldInferType`). Used to distinguish a return type
+    /// the user wrote (e.g. an explicit `-> Never`) from one Pyrefly inferred,
+    /// which lets override-consistency logic relax inferred placeholder returns
+    /// without overriding what the user explicitly declared.
+    pub is_return_inferred: bool,
     /// A function decorated with `typing.dataclass_transform(...)`, turning it into a
     /// `dataclasses.dataclass`-like decorator. Stores the keyword values passed to the
     /// `dataclass_transform` call. See
@@ -1233,10 +1309,11 @@ pub fn unexpected_keyword(error: &dyn Fn(String), func: &str, keyword: &Keyword)
 
 #[cfg(test)]
 mod tests {
-    use pyrefly_util::uniques::UniqueFactory;
+    use pyrefly_python::module_name::ModuleName;
     use pyrefly_util::visit::Visit;
     use pyrefly_util::visit::VisitMut;
     use ruff_python_ast::name::Name;
+    use ruff_text_size::TextRange;
 
     use crate::callable::Callable;
     use crate::callable::DefaultValue;
@@ -1244,8 +1321,11 @@ mod tests {
     use crate::callable::ParamList;
     use crate::callable::PrefixParam;
     use crate::callable::Required;
+    use crate::quantified::AnchorIndex;
     use crate::quantified::Quantified;
+    use crate::quantified::QuantifiedIdentity;
     use crate::quantified::QuantifiedKind;
+    use crate::quantified::QuantifiedOrigin;
     use crate::type_var::PreInferenceVariance;
     use crate::type_var::Restriction;
     use crate::types::Type;
@@ -1382,9 +1462,12 @@ mod tests {
 
     #[test]
     fn test_default_value_visit_delegates_to_ty() {
-        let uniques = UniqueFactory::new();
         let q = Quantified::new(
-            uniques.fresh(),
+            QuantifiedIdentity::new(
+                ModuleName::from_str("__test__"),
+                AnchorIndex::first(TextRange::default()),
+                QuantifiedOrigin::Pep695,
+            ),
             Name::new("T"),
             QuantifiedKind::TypeVar,
             None,
@@ -1402,9 +1485,12 @@ mod tests {
 
     #[test]
     fn test_default_value_visit_mut_delegates_to_ty() {
-        let uniques = UniqueFactory::new();
         let q = Quantified::new(
-            uniques.fresh(),
+            QuantifiedIdentity::new(
+                ModuleName::from_str("__test__"),
+                AnchorIndex::new(TextRange::default(), 1),
+                QuantifiedOrigin::Pep695,
+            ),
             Name::new("T"),
             QuantifiedKind::TypeVar,
             None,

@@ -160,6 +160,50 @@ def f2(x: E | int):
 );
 
 testcase!(
+    test_is_not_final_enum,
+    r#"
+from enum import Enum
+from typing import Final, Iterable, assert_type
+
+class EmptyType(Enum):
+    EMPTY = 0
+
+Empty: Final = EmptyType.EMPTY
+
+class Bar:
+    baz: int | EmptyType = 4
+
+def foo(bar: Bar) -> Iterable[int]:
+    if bar.baz is not Empty:
+        assert_type(bar.baz, int)
+        return [bar.baz]
+    return []
+    "#,
+);
+
+testcase!(
+    test_is_not_final_enum_type_alias,
+    r#"
+from enum import Enum
+from typing import Final, Iterable, Literal, TypeAlias
+
+class _EmptyEnum(Enum):
+    EMPTY = 0
+
+EmptyType: TypeAlias = Literal[_EmptyEnum.EMPTY]
+Empty: Final = _EmptyEnum.EMPTY
+
+class Bar:
+    baz: int | EmptyType = 4
+
+def foo(bar: Bar) -> Iterable[int]:
+    if bar.baz is not Empty:
+        return [bar.baz]
+    return []
+    "#,
+);
+
+testcase!(
     test_ellipsis_is,
     r#"
 from typing import reveal_type
@@ -601,6 +645,41 @@ def f(e: E):
             assert_type(e, Literal[E.Y])
         case _:
             assert_type(e, Literal[E.Z])
+    "#,
+);
+
+testcase!(
+    test_match_enum_self_fallback,
+    r#"
+from enum import Enum, auto
+from typing import assert_never, final
+
+class ExtendableTime(Enum):
+    DAY = auto()
+    NIGHT = auto()
+
+    def bye(self):
+        match self:
+            case ExtendableTime.DAY:
+                pass
+            case ExtendableTime.NIGHT:
+                pass
+            case _ as unreachable:
+                assert_never(unreachable)
+
+@final
+class FinalTime(Enum):
+    DAY = auto()
+    NIGHT = auto()
+
+    def bye(self):
+        match self:
+            case FinalTime.DAY:
+                pass
+            case FinalTime.NIGHT:
+                pass
+            case _ as unreachable:
+                assert_never(unreachable)
     "#,
 );
 
@@ -1934,6 +2013,14 @@ def test_type_objects_mixed_with_literals(x: type[int] | type[float] | None, y: 
         assert_type(y, Literal[1] | type[int])
     else:
         assert_type(y, type[int] | type[str])
+
+def test_tuple_of_literal_alias(severity: str) -> None:
+    from typing import cast, get_args
+
+    SeverityLevel = Literal["light", "minor", "major"]
+    SEVERITY_LEVELS = cast(tuple[SeverityLevel, ...], get_args(SeverityLevel))
+    if severity in SEVERITY_LEVELS:
+        assert_type(severity, SeverityLevel)
 "#,
 );
 

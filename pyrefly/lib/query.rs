@@ -33,8 +33,6 @@ use pyrefly_types::callable::PropertyRole;
 use pyrefly_types::class::Class;
 use pyrefly_types::class::ClassFields;
 use pyrefly_types::literal::Lit;
-use pyrefly_types::literal::Literal;
-use pyrefly_types::quantified::Quantified;
 use pyrefly_types::quantified::QuantifiedKind;
 use pyrefly_types::type_alias::TypeAliasData;
 use pyrefly_types::type_var::Restriction;
@@ -42,9 +40,9 @@ use pyrefly_types::typed_dict::TypedDict;
 use pyrefly_types::types::BoundMethodType;
 use pyrefly_types::types::Forallable;
 use pyrefly_types::types::Type;
-use pyrefly_types::types::Union;
 use pyrefly_util::events::CategorizedEvents;
 use pyrefly_util::lined_buffer::LineNumber;
+use pyrefly_util::lined_buffer::PythonASTRange;
 use pyrefly_util::lock::Mutex;
 use pyrefly_util::prelude::SliceExt;
 use pyrefly_util::prelude::VecExt;
@@ -163,9 +161,6 @@ pub struct Attribute {
     pub is_final: bool,
 }
 
-/// Re-export from `pyrefly_util::lined_buffer` for backwards compatibility.
-pub use pyrefly_util::lined_buffer::PythonASTRange;
-
 /// Thin wrapper around `LinedBuffer::python_ast_range_for_expr` that accepts
 /// a `ModuleInfo` for convenience. Callers with direct access to a
 /// `LinedBuffer` can call the method directly.
@@ -182,7 +177,7 @@ pub fn python_ast_range_for_expr(
 
 fn is_static_method(ty: &Type) -> bool {
     match ty {
-        Type::Union(box Union { members: tys, .. }) => tys.iter().all(is_static_method),
+        Type::Union(u) => u.members.iter().all(is_static_method),
         Type::BoundMethod(m) => m.func.metadata().flags.is_staticmethod,
         Type::Function(f) => f.metadata.flags.is_staticmethod,
         Type::Forall(f) => {
@@ -198,16 +193,12 @@ fn is_static_method(ty: &Type) -> bool {
 
 fn bound_of_type_var(ty: &Type) -> Option<&Type> {
     match ty {
-        Type::Quantified(box Quantified {
-            kind: QuantifiedKind::TypeVar,
-            restriction: Restriction::Bound(bound),
-            ..
-        })
-        | Type::QuantifiedValue(box Quantified {
-            kind: QuantifiedKind::TypeVar,
-            restriction: Restriction::Bound(bound),
-            ..
-        }) => Some(bound),
+        Type::Quantified(q) | Type::QuantifiedValue(q)
+            if q.kind == QuantifiedKind::TypeVar
+                && let Restriction::Bound(bound) = &q.restriction =>
+        {
+            Some(bound)
+        }
         _ => None,
     }
 }
@@ -335,10 +326,10 @@ impl<'a> CalleesWithLocation<'a> {
                     };
                 (callees, attr.range())
             }
-            Expr::Call(ExprCall {
-                func: box Expr::Name(name),
-                ..
-            }) if name.id() == "prod_assert" => {
+            Expr::Call(ExprCall { func, .. })
+                if let Expr::Name(name) = &**func
+                    && name.id() == "prod_assert" =>
+            {
                 // pyrefly has special treatment for prod_assert but for our purposes we still want to see this call
                 let callees = vec![Callee {
                     kind: String::from(CALLEE_KIND_FUNCTION),
@@ -630,10 +621,10 @@ impl<'a> CalleesWithLocation<'a> {
                 TypedDict::TypedDict(inner) => Self::class_info_for_qname(inner.qname(), true),
                 TypedDict::Anonymous(_) => vec![],
             },
-            Type::Literal(box Literal {
-                value: Lit::Str(_), ..
-            })
-            | Type::LiteralString(_) => {
+            Type::Literal(lit) if matches!(lit.value, Lit::Str(_)) => {
+                vec![(String::from("builtins.str"), false)]
+            }
+            Type::LiteralString(_) => {
                 vec![(String::from("builtins.str"), false)]
             }
             Type::Literal(lit) if let Lit::Int(_) = lit.value => {
@@ -652,7 +643,8 @@ impl<'a> CalleesWithLocation<'a> {
                     .flat_map(Self::class_info_from_bound_obj)
                     .collect_vec(),
             },
-            Type::Union(box Union { members: tys, .. }) => tys
+            Type::Union(u) => u
+                .members
                 .iter()
                 .flat_map(Self::class_info_from_bound_obj)
                 .collect_vec(),
@@ -772,7 +764,7 @@ impl<'a> CalleesWithLocation<'a> {
     fn init_or_new_from_type(&self, ty: &Type, callee_range: TextRange) -> Vec<Callee> {
         match ty {
             Type::SelfType(c) | Type::ClassType(c) => self.find_init_or_new(c.class_object()),
-            Type::Quantified(box q) => match &q.restriction {
+            Type::Quantified(q) => match &q.restriction {
                 Restriction::Bound(Type::ClassType(c)) => self.find_init_or_new(c.class_object()),
                 Restriction::Constraints(tys) => self.init_or_new_from_union(tys, callee_range),
                 x => panic!(
@@ -780,9 +772,7 @@ impl<'a> CalleesWithLocation<'a> {
                     self.module_info.display_range(callee_range)
                 ),
             },
-            Type::Union(box Union { members: tys, .. }) => {
-                self.init_or_new_from_union(tys, callee_range)
-            }
+            Type::Union(u) => self.init_or_new_from_union(&u.members, callee_range),
             Type::Any(_) => vec![],
             x => {
                 panic!(
@@ -810,9 +800,10 @@ impl<'a> CalleesWithLocation<'a> {
                 ),
             },
             Type::Never(_) => vec![],
-            Type::Union(box Union { members: tys, .. }) => {
+            Type::Union(u) => {
                 // get callee for each type
-                tys.iter()
+                u.members
+                    .iter()
                     .flat_map(|t| {
                         self.callee_from_type(t, call_target, callee_range, call_arguments)
                     })
@@ -852,7 +843,7 @@ impl<'a> CalleesWithLocation<'a> {
                 }]
             }
             Type::Callable(..) => self.for_callable(callee_range),
-            Type::Type(box ty) => self.init_or_new_from_type(ty, callee_range),
+            Type::Type(ty) => self.init_or_new_from_type(ty, callee_range),
             // Annotated[T, ...] is not callable (matching as_call_target_impl).
             Type::Annotated(_, _) => vec![],
 
@@ -881,10 +872,12 @@ impl<'a> CalleesWithLocation<'a> {
             }
             Type::Any(_) => vec![],
             Type::Literal(_) => vec![],
-            Type::TypeAlias(box TypeAliasData::Value(t)) => {
-                self.callee_from_type(&t.as_type(), call_target, callee_range, call_arguments)
-            }
-            Type::TypeAlias(box TypeAliasData::Ref(_)) => vec![],
+            Type::TypeAlias(data) => match &**data {
+                TypeAliasData::Value(t) => {
+                    self.callee_from_type(&t.as_type(), call_target, callee_range, call_arguments)
+                }
+                TypeAliasData::Ref(_) => vec![],
+            },
             _ => panic!(
                 "unexpected type at [{}]: {ty:?}",
                 self.module_info.display_range(callee_range)
@@ -1058,6 +1051,7 @@ impl Query {
                         _ => answers.get_idx(class_field_idx).map(|cf| cf.ty()),
                     };
                     let field_ty = field_ty?;
+                    let field_ty = answers.solver().for_export_boundary(field_ty);
                     let (kind, field_ty) = get_kind_and_field_type(&field_ty);
 
                     Some(Attribute {

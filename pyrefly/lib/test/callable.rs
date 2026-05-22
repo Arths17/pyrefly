@@ -1408,8 +1408,7 @@ class Class7(Generic[T]):
         pass
 
 r7 = accepts_callable(Class7)
-# pyrefly incorrectly errors on these - should be OK
-assert_type(r7(""), Class7[str])  # E: assert_type(Class7[int], Class7[str]) failed # E: Argument `Literal['']` is not assignable
+assert_type(r7(""), Class7[str])
 
 class Class8(Generic[T]):
     def __new__(cls, x: list[T], y: list[T]) -> Self:
@@ -1433,6 +1432,17 @@ class Pipeline:
 
     def run(self, data: object) -> object:
         return self.model(data)
+"#,
+);
+
+// Regression test for https://github.com/facebook/pyrefly/issues/1178
+testcase!(
+    test_callable_as_base_class,
+    r#"
+from collections.abc import Callable
+
+class A(Callable):  # E: Invalid base class
+    pass
 "#,
 );
 

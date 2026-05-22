@@ -50,7 +50,7 @@ testcase!(
     test_implicit_any_no_inference,
     TestEnv::new_with_untyped_def_behavior(UntypedDefBehavior::SkipAndInferReturnAny)
         .enable_unannotated_return_error()
-        .enable_unannotated_parameter_error(),
+        .enable_implicit_any_parameter_error(),
     r#"
 def foo(x, y):  # E: `foo` is missing an annotation for parameter `x` # E: `foo` is missing an annotation for parameter `y` # E: `foo` is missing a return annotation
     return 1
@@ -61,7 +61,7 @@ testcase!(
     test_implicit_any_with_inference,
     TestEnv::new_with_untyped_def_behavior(UntypedDefBehavior::CheckAndInferReturnType)
         .enable_unannotated_return_error()
-        .enable_unannotated_parameter_error(),
+        .enable_implicit_any_parameter_error(),
     r#"
 def foo(x, y):  # E: `foo` is missing an annotation for parameter `x` # E: `foo` is missing an annotation for parameter `y` # E: `foo` is missing a return annotation
     return 1
@@ -85,7 +85,7 @@ class C:
 // https://github.com/facebook/pyrefly/issues/2327
 testcase!(
     test_unannotated_parameter_first_param_by_position,
-    TestEnv::new().enable_unannotated_parameter_error(),
+    TestEnv::new().enable_implicit_any_parameter_error(),
     r#"
 class A:
     def __new__(cls, a: int) -> "A": ...
@@ -172,13 +172,50 @@ x2 = {}
 );
 
 testcase!(
+    test_explicit_any_default_disabled,
+    r#"
+from typing import Any
+
+def f(value: Any) -> Any:
+    print(value.asdfsdf)
+    return value
+"#,
+);
+
+testcase!(
+    test_explicit_any_error,
+    TestEnv::new().enable_explicit_any_error(),
+    r#"
+from typing import Any, TypeAlias
+
+def f(value: Any) -> Any:  # E: Explicit `Any` is not allowed # E: Explicit `Any` is not allowed
+    print(value.asdfsdf)
+    return value
+
+xs: list[Any] = []  # E: Explicit `Any` is not allowed
+Alias: TypeAlias = dict[str, Any]  # E: Explicit `Any` is not allowed
+"#,
+);
+
+testcase!(
     test_warn_on_implicit_any_in_attribute,
-    TestEnv::new().enable_unannotated_attribute_error(),
+    TestEnv::new().enable_implicit_any_attribute_error(),
     r#"
 from typing import Any
 class A:
     def __init__(self):
         self.x = None  # E: implicitly inferred to be `Any | None`
+    "#,
+);
+
+testcase!(
+    test_implicit_any_attribute_slots_excluded,
+    TestEnv::new().enable_implicit_any_attribute_error(),
+    r#"
+class A:
+    __slots__ = ()
+    __match_args__ = ()
+    x = ()  # E: implicitly inferred to be `tuple[Any, ...]`
     "#,
 );
 

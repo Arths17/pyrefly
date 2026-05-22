@@ -197,6 +197,7 @@ impl TensorOpsRegistry {
         registry.register("torch.ones", dsl_fn(&fn_lookup, "randn_ir"));
         registry.register("torch.empty", dsl_fn(&fn_lookup, "randn_ir"));
         registry.register("torch.full", dsl_fn(&fn_lookup, "randn_ir"));
+        registry.register("torch.randint", dsl_fn(&fn_lookup, "randint_ir"));
         registry.register("torch.arange", dsl_fn(&fn_lookup, "arange_ir"));
         registry.register("torch.linspace", dsl_fn(&fn_lookup, "linspace_ir"));
         registry.register("torch.eye", dsl_fn(&fn_lookup, "eye_ir"));
@@ -476,6 +477,12 @@ impl TensorOpsRegistry {
         );
         registry.register_init_forward(
             &fn_lookup,
+            "torch.nn.GRU",
+            "nn_gru_forward_ir",
+            &["input_size", "hidden_size", "num_layers", "bidirectional"],
+        );
+        registry.register_init_forward(
+            &fn_lookup,
             "torch.nn.LSTMCell",
             "nn_lstmcell_forward_ir",
             &["input_size", "hidden_size"],
@@ -532,7 +539,7 @@ impl TensorOpsRegistry {
     /// `class_name` is the qualified class name (e.g., `"torch.nn.MaxPool2d"`).
     /// This registers the forward function under `"{class_name}.forward"` and
     /// the init captures under `"{class_name}"`.
-    pub(crate) fn register_init_forward(
+    fn register_init_forward(
         &mut self,
         fn_lookup: &Arc<HashMap<String, Arc<DslFnDef>>>,
         class_name: &str,
@@ -639,8 +646,8 @@ def reshape_ir(self: Tensor, shape: list[int | symint]) -> Tensor:
     if has_zero:
         raise Error("reshape dimensions cannot contain 0")
     if minus_one_count > 0:
-        known = torch_shapes.prod([d for d in shape if d != -1])
-        total = torch_shapes.prod(self.shape)
+        known = shape_extensions.prod([d for d in shape if d != -1])
+        total = shape_extensions.prod(self.shape)
         if isinstance(total, int) and isinstance(known, int) and total % known != 0:
             raise Error("could not infer size for dimension -1: expected " + str(total) + " to be divisible by " + str(known))
         return Tensor(shape=[total // known if d == -1 else d for d in shape])
@@ -672,7 +679,7 @@ def flatten_ir(self: Tensor, start_dim: int = 0, end_dim: int = -1) -> Tensor:
     rank = len(self.shape)
     s = normalize_dim(rank, start_dim)
     e = normalize_dim(rank, end_dim)
-    return Tensor(shape=self.shape[:s] + [torch_shapes.prod(self.shape[s:e + 1])] + self.shape[e + 1:])
+    return Tensor(shape=self.shape[:s] + [shape_extensions.prod(self.shape[s:e + 1])] + self.shape[e + 1:])
 
 def expand_ir(self: Tensor, sizes: list[int | symint]) -> Tensor:
     return Tensor(shape=[d if t == -1 else t for d, t in zip(self.shape, sizes)])
@@ -695,7 +702,7 @@ def unfold_ir(self: Tensor, dimension: int, size: int | symint, step: int = 1) -
 def cat_ir(tensors: list[Tensor], dim: int = 0) -> Tensor:
     first = tensors[0]
     d = normalize_dim(len(first.shape), dim)
-    return Tensor(shape=[torch_shapes.sum([t.shape[i] for t in tensors]) if i == d else dim_val for i, dim_val in enumerate(first.shape)])
+    return Tensor(shape=[shape_extensions.sum([t.shape[i] for t in tensors]) if i == d else dim_val for i, dim_val in enumerate(first.shape)])
 
 def stack_ir(tensors: list[Tensor], dim: int = 0) -> Tensor:
     first = tensors[0]
@@ -785,7 +792,7 @@ def topk_ir(self: Tensor, k: int | symint, dim: int = -1) -> [Tensor, Tensor]:
 
 def repeat_interleave_ir(self: Tensor, repeats: int | symint, dim: int | None = None) -> Tensor:
     if dim == None:
-        return Tensor(shape=[torch_shapes.prod(self.shape) * repeats])
+        return Tensor(shape=[shape_extensions.prod(self.shape) * repeats])
     d = normalize_dim(len(self.shape), dim)
     return Tensor(shape=replace_dim(self.shape, d, self.shape[d] * repeats))
 
@@ -794,6 +801,9 @@ def cosine_similarity_ir(x1: Tensor, x2: Tensor, dim: int = 1) -> Tensor:
     return Tensor(shape=reduce_single(s, normalize_dim(len(s), dim), False))
 
 def randn_ir(size: list[int | symint]) -> Tensor:
+    return Tensor(shape=size)
+
+def randint_ir(low: int, high: int, size: list[int | symint]) -> Tensor:
     return Tensor(shape=size)
 
 def linspace_ir(steps: int | symint) -> Tensor:
@@ -871,10 +881,10 @@ def apply_einsum(output_map: list[list[int]], check_pairs: list[list[int]], inpu
         raise Error("einsum: inconsistent dimensions for repeated index")
     return Tensor(shape=[inputs[inp].shape[dim] for inp, dim in output_map])
 
-def einsum_ir(spec: str, inputs: list[Tensor] | None = None) -> Tensor:
-    if inputs != None:
-        output_map, check_pairs = torch_shapes.parse_einsum_equation(spec)
-        return apply_einsum(output_map, check_pairs, inputs)
+def einsum_ir(spec: str, operands: list[Tensor] | None = None) -> Tensor:
+    if operands != None:
+        output_map, check_pairs = shape_extensions.parse_einsum_equation(spec)
+        return apply_einsum(output_map, check_pairs, operands)
     return Unknown
 
 def eigvals_ir(self: Tensor) -> Tensor:
@@ -965,7 +975,7 @@ def size_ir(self: Tensor, dim: int | None = None) -> int | symint:
     return [d for d in self.shape]
 
 def numel_ir(self: Tensor) -> int | symint:
-    return torch_shapes.prod(self.shape)
+    return shape_extensions.prod(self.shape)
 
 def dim_ir(self: Tensor) -> int:
     return len(self.shape)
@@ -1014,6 +1024,12 @@ def nn_lstm_forward_ir(input: Tensor, input_size: symint, hidden_size: symint, n
     h_n = Tensor(shape=[num_layers * nd, input.shape[0], hidden_size])
     c_n = Tensor(shape=[num_layers * nd, input.shape[0], hidden_size])
     return [output, h_n, c_n]
+
+def nn_gru_forward_ir(input: Tensor, input_size: symint, hidden_size: symint, num_layers: symint = 1, bidirectional: bool = False) -> [Tensor, Tensor]:
+    nd = 2 if bidirectional else 1
+    output = Tensor(shape=[input.shape[0], input.shape[1], hidden_size * nd])
+    h_n = Tensor(shape=[num_layers * nd, input.shape[0], hidden_size])
+    return [output, h_n]
 
 def nn_lstmcell_forward_ir(input: Tensor, input_size: symint, hidden_size: symint) -> [Tensor, Tensor]:
     h = Tensor(shape=[input.shape[0], hidden_size])

@@ -27,7 +27,9 @@ When looking for an issue to pick up, consider the following things:
 Development docs are WIP. Please reach out if you are working on an issue and
 have questions or want a code pointer.
 
-As described in the README, our architecture follows 3 phases:
+As described in the
+[architecture overview](https://github.com/facebook/pyrefly/blob/main/ARCHITECTURE.md),
+our architecture follows 3 phases:
 
 1. figuring out exports
 2. making bindings
@@ -74,7 +76,7 @@ the command line.
 ## Coding conventions
 
 We follow the
-[Buck2 coding conventions](https://github.com/facebook/buck2/blob/main/HACKING.md#coding-conventions),
+[Buck2 coding convention](https://github.com/facebook/buck2/blob/main/docs/developers/basics.md),
 with the caveat that we use our internal error framework for errors reported by
 the type checker.
 

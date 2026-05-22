@@ -163,7 +163,7 @@ fn read_and_validate_file(path: &Path) -> anyhow::Result<(String, ModModule)> {
 /// Extracts error codes from an existing pyrefly ignore comment.
 /// Returns Some(Vec<String>) if the line contains a valid ignore comment, None otherwise.
 /// Uses string-aware parsing to avoid matching inside string literals.
-fn parse_ignore_comment(line: &str) -> Option<Vec<String>> {
+pub(crate) fn parse_ignore_comment(line: &str) -> Option<Vec<String>> {
     let comment_start = find_comment_start_in_line(line)?;
     let comment_part = &line[comment_start..];
     let regex = Regex::new(r"#\s*pyrefly:\s*ignore\s*\[([^\]]*)\]").unwrap();
@@ -222,7 +222,7 @@ fn get_indentation(line: &str) -> &str {
 
 /// Merges new error codes with existing ones in a suppression comment.
 /// Returns the updated comment string with merged and sorted error codes.
-fn merge_error_codes(existing_codes: Vec<String>, new_codes: &[String]) -> String {
+pub(crate) fn merge_error_codes(existing_codes: Vec<String>, new_codes: &[String]) -> String {
     let mut all_codes: SmallSet<String> = SmallSet::new();
     for code in existing_codes {
         all_codes.insert(code);
@@ -238,7 +238,7 @@ fn merge_error_codes(existing_codes: Vec<String>, new_codes: &[String]) -> Strin
 /// Replaces the ignore comment in a line with the merged version.
 /// Preserves the rest of the line content.
 /// Uses string-aware parsing to only replace in the comment portion.
-fn replace_ignore_comment(line: &str, merged_comment: &str) -> String {
+pub(crate) fn replace_ignore_comment(line: &str, merged_comment: &str) -> String {
     if let Some(comment_start) = find_comment_start_in_line(line) {
         let code_part = &line[..comment_start];
         let comment_part = &line[comment_start..];
@@ -376,27 +376,14 @@ fn add_suppressions(
                     buf.push_str(error_comment);
                     buf.push_str(line_ending);
                 } else {
-                    // Calculate once whether suppression goes below this line
-                    let suppression_below =
-                        idx + 1 < lines.len() && lines_to_skip.contains(&(idx + 1));
-
-                    if !suppression_below {
-                        // Add suppression line above (normal case)
-                        buf.push_str(get_indentation(line));
-                        buf.push_str(error_comment);
-                        buf.push_str(line_ending);
-                    }
+                    // Add suppression line above the error line
+                    buf.push_str(get_indentation(line));
+                    buf.push_str(error_comment);
+                    buf.push_str(line_ending);
 
                     // Write the current line as-is
                     buf.push_str(line);
                     buf.push_str(line_ending);
-
-                    if suppression_below {
-                        // Add suppression line below
-                        buf.push_str(get_indentation(lines[idx + 1]));
-                        buf.push_str(error_comment);
-                        buf.push_str(line_ending);
-                    }
                 }
             } else {
                 // No error on this line, write as-is
@@ -622,6 +609,7 @@ mod tests {
     use pyrefly_python::sys_info::SysInfo;
     use pyrefly_util::arc_id::ArcId;
     use pyrefly_util::fs_anyhow;
+    use pyrefly_util::thread_pool::TEST_THREAD_COUNT;
     use tempfile;
     use tempfile::TempDir;
 
@@ -633,7 +621,6 @@ mod tests {
     use crate::state::load::FileContents;
     use crate::state::require::Require;
     use crate::state::state::State;
-    use crate::test::util::TEST_THREAD_COUNT;
 
     fn get_path(tdir: &TempDir) -> PathBuf {
         tdir.path().join("test.py")
@@ -666,6 +653,23 @@ mod tests {
     }
 
     fn assert_remove_ignores(before: &str, after: &str, expected_removals: usize) {
+        let (errors, tdir) = get_errors(before);
+        let collected = errors.collect_errors();
+        let unused_errors = errors.collect_unused_ignore_errors(&collected);
+        let removals = suppress::remove_unused_ignores(unused_errors);
+        let got_file = fs_anyhow::read_to_string(&get_path(&tdir)).unwrap();
+        assert_eq!(after, got_file);
+        assert_eq!(removals, expected_removals);
+    }
+
+    /// Mimics the `suppress --remove-unused` code path, which delegates to
+    /// `check --remove-unused-ignores` internally. This collects unused ignore
+    /// errors without severity filtering and removes them.
+    fn assert_remove_ignores_via_suppress_command(
+        before: &str,
+        after: &str,
+        expected_removals: usize,
+    ) {
         let (errors, tdir) = get_errors(before);
         let collected = errors.collect_errors();
         let unused_errors = errors.collect_unused_ignore_errors(&collected);
@@ -801,6 +805,50 @@ def foo(x: int) -> str:
 x: int = foo("Hello")
 "#,
         );
+    }
+
+    #[test]
+    fn test_add_suppressions_adjacent_lines_with_interleaved_existing_suppressions() {
+        // Regression test: when two consecutive code lines each have an existing
+        // `# pyrefly: ignore` comment above them, and new errors are added to both,
+        // each suppression must remain directly above its error line.
+        let tdir = tempfile::tempdir().unwrap();
+        let path = tdir.path().join("test.py");
+        let before = "\
+def foo() -> None:
+    # pyrefly: ignore [some-error]
+    x = 1
+    # pyrefly: ignore [some-error]
+    y = 2
+";
+        fs_anyhow::write(&path, before).unwrap();
+
+        let errors = vec![
+            SerializedError {
+                path: path.clone(),
+                line: 2, // x = 1 (0-indexed)
+                name: "new-error".to_owned(),
+                message: String::new(),
+            },
+            SerializedError {
+                path: path.clone(),
+                line: 4, // y = 2 (0-indexed)
+                name: "new-error".to_owned(),
+                message: String::new(),
+            },
+        ];
+
+        suppress::suppress_errors(errors, CommentLocation::LineBefore);
+
+        let result = fs_anyhow::read_to_string(&path).unwrap();
+        let expected = "\
+def foo() -> None:
+    # pyrefly: ignore [new-error, some-error]
+    x = 1
+    # pyrefly: ignore [new-error, some-error]
+    y = 2
+";
+        assert_eq!(result, expected);
     }
 
     #[test]
@@ -1969,6 +2017,66 @@ x: int = \
 x: int = \
     "a" + \
     2
+"#,
+        );
+    }
+
+    #[test]
+    fn test_suppress_remove_unused_without_config() {
+        // `suppress --remove-unused` should remove unused ignore comments even
+        // without explicit config, matching `check --remove-unused-ignores`.
+        let input = r#"
+def f() -> int:
+    # pyrefly: ignore [bad-return]
+    return 1
+"#;
+        let want = r#"
+def f() -> int:
+    return 1
+"#;
+        assert_remove_ignores_via_suppress_command(input, want, 1);
+    }
+
+    #[test]
+    fn test_suppress_multiline_fstring_attribute_access() {
+        // Regression test: when a missing-attribute error occurs on an
+        // interpolation inside a multi-line f-string, the suppression must
+        // be placed above the f-string, NOT inside the string literal.
+        let input = r#"
+def foo(x: tuple) -> None:
+    print(f"""value: {x.bad_attr} and {x.other_bad_attr}""")
+"#;
+        assert_suppress_errors(
+            input,
+            r#"
+def foo(x: tuple) -> None:
+    # pyrefly: ignore [missing-attribute]
+    print(f"""value: {x.bad_attr} and {x.other_bad_attr}""")
+"#,
+        );
+    }
+
+    #[test]
+    fn test_suppress_multiline_fstring_attr_on_separate_lines() {
+        // Regression test: when errors are on separate lines inside a
+        // multi-line f-string, all suppressions go above the f-string
+        // opening line, not inside the string body.
+        let input = r#"
+def foo(x: tuple) -> None:
+    print(f"""
+        first: {x.bad_attr}
+        second: {x.other_bad_attr}
+    """)
+"#;
+        assert_suppress_errors(
+            input,
+            r#"
+def foo(x: tuple) -> None:
+    # pyrefly: ignore [missing-attribute]
+    print(f"""
+        first: {x.bad_attr}
+        second: {x.other_bad_attr}
+    """)
 "#,
         );
     }

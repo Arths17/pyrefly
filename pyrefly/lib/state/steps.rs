@@ -109,6 +109,20 @@ pub enum Step {
 }
 
 impl Step {
+    /// Variant name as a static string. Used by demand-tree consumers
+    /// (`pyrefly check --report-demand-tree` and the laziness test
+    /// framework) so the label survives across crates without forcing
+    /// callers to format through `Display`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Step::Load => "Load",
+            Step::Ast => "Ast",
+            Step::Exports => "Exports",
+            Step::Answers => "Answers",
+            Step::Solutions => "Solutions",
+        }
+    }
+
     /// Encode a step as a u8 for atomic storage.
     fn to_u8(self) -> u8 {
         self as u8
@@ -433,7 +447,6 @@ impl Step {
             ctx.lookup,
             *ctx.sys_info,
             &load.errors,
-            ctx.uniques,
             enable_trace,
             ctx.check_unannotated_defs,
             ctx.require.keep_index(),

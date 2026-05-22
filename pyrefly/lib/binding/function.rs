@@ -15,6 +15,7 @@ use pyrefly_python::dunder;
 use pyrefly_python::nesting_context::NestingContext;
 use pyrefly_python::short_identifier::ShortIdentifier;
 use pyrefly_python::sys_info::SysInfo;
+use pyrefly_types::callable::PlaceholderBodyKind;
 use pyrefly_util::prelude::VecExt;
 use pyrefly_util::visit::Visit;
 use ruff_python_ast::Decorator;
@@ -605,7 +606,12 @@ impl<'a> BindingsBuilder<'a> {
         parent: &NestingContext,
         undecorated_idx: Idx<KeyUndecoratedFunction>,
         class_key: Option<Idx<KeyClass>>,
-    ) -> (FunctionStubOrImpl, Option<SelfAssignments>) {
+    ) -> (
+        FunctionStubOrImpl,
+        Option<PlaceholderBodyKind>,
+        bool,
+        Option<SelfAssignments>,
+    ) {
         // If the first statement in the body is a docstring, remove it
         let body_no_docstring = if let Some(s) = body.first()
             && is_docstring(s)
@@ -624,22 +630,25 @@ impl<'a> BindingsBuilder<'a> {
                 [Stmt::Pass(_)] => true,
                 _ => false,
             });
-        let body_is_not_implemented = match body_no_docstring {
+        let placeholder_body_kind = match body_no_docstring {
             // raise NotImplementedError(...)
-            [
-                Stmt::Raise(StmtRaise {
-                    exc: Some(box (Expr::Call(ExprCall { box func, .. }) | func)),
-                    ..
-                }),
-            ] if self.as_special_export(func) == Some(SpecialExport::NotImplementedError) => true,
+            [Stmt::Raise(StmtRaise { exc: Some(exc), .. })]
+                if self.as_special_export(match &**exc {
+                    Expr::Call(ExprCall { func, .. }) => func,
+                    other => other,
+                }) == Some(SpecialExport::NotImplementedError) =>
+            {
+                Some(PlaceholderBodyKind::RaiseNotImplementedError)
+            }
             // return NotImplemented
             [
                 Stmt::Return(StmtReturn {
-                    value: Some(box val),
-                    ..
+                    value: Some(val), ..
                 }),
-            ] if self.as_special_export(val) == Some(SpecialExport::NotImplemented) => true,
-            _ => false,
+            ] if self.as_special_export(val) == Some(SpecialExport::NotImplemented) => {
+                Some(PlaceholderBodyKind::ReturnNotImplemented)
+            }
+            _ => None,
         };
         // A `...` body is always interpreted as a stub function.
         // Functions with other trivial bodies are interpreted as stubs in some contexts.
@@ -655,7 +664,7 @@ impl<'a> BindingsBuilder<'a> {
         };
         let should_report_unused_parameters = stub_or_impl == FunctionStubOrImpl::Impl
             && !body_is_trivial
-            && !body_is_not_implemented
+            && placeholder_body_kind.is_none()
             && !decorators.is_overload
             && !decorators.is_override
             && !decorators.is_abstract_method;
@@ -671,11 +680,11 @@ impl<'a> BindingsBuilder<'a> {
 
         let is_unannotated =
             !self.check_unannotated_defs && !is_annotated(&return_ann_with_range, parameters);
-        let self_assignments = if decorators.has_no_type_check
+        let (is_return_inferred, self_assignments) = if decorators.has_no_type_check
             || (is_unannotated && !self.analyze_unannotated_for_ide)
         {
             self.mark_as_returns_any(func_name, class_key, is_async);
-            self.unchecked_function_body_scope(
+            let self_assignments = self.unchecked_function_body_scope(
                 parameters,
                 body,
                 range,
@@ -685,7 +694,8 @@ impl<'a> BindingsBuilder<'a> {
                 is_async,
                 method_self_kind,
                 decorators.has_no_type_check,
-            )
+            );
+            (false, self_assignments)
         } else if is_unannotated {
             let implicit_return = Some(self.implicit_return(&body, func_name));
             let (yields_and_returns, self_assignments, _, _) = self.function_body_scope(
@@ -709,7 +719,7 @@ impl<'a> BindingsBuilder<'a> {
                 false,
                 stub_or_impl,
             );
-            self_assignments
+            (false, self_assignments)
         } else {
             // Compute implicit_return: in this branch the body is always fully analyzed,
             // so we can always determine whether there's an implicit return.
@@ -745,13 +755,32 @@ impl<'a> BindingsBuilder<'a> {
                 should_infer,
                 stub_or_impl,
             );
-            self_assignments
+            // Mirror the `ReturnTypeKind::ShouldInferType` arm in `analyze_return_type`:
+            // we infer iff there's no return annotation and inference was requested.
+            // `implicit_return` is always `Some` in this branch. We additionally
+            // exclude unannotated `__new__`, whose effective return type is
+            // overridden to `Self` at solve time (see `implicit_dunder_new_self`),
+            // not the body-inferred type — so callers should not treat the
+            // visible return as derived from the body.
+            let is_implicit_dunder_new = func_name.id == dunder::NEW && class_key.is_some();
+            let is_return_inferred =
+                should_infer && return_ann_with_range.is_none() && !is_implicit_dunder_new;
+            (is_return_inferred, self_assignments)
         };
 
-        (stub_or_impl, self_assignments)
+        (
+            stub_or_impl,
+            placeholder_body_kind,
+            is_return_inferred,
+            self_assignments,
+        )
     }
 
     pub fn function_def(&mut self, mut x: StmtFunctionDef, parent: &NestingContext) {
+        // This is to handle "def" with no func name after
+        if x.name.id.is_empty() {
+            return;
+        }
         let func_name = x.name.clone();
         let mut def_idx =
             self.declare_current_idx(Key::Definition(ShortIdentifier::new(&func_name)));
@@ -782,18 +811,19 @@ impl<'a> BindingsBuilder<'a> {
         let decorators = self.decorators(mem::take(&mut x.decorator_list), def_idx.usage());
 
         let docstring_range = Docstring::range_from_stmts(x.body.as_slice());
-        let (stub_or_impl, self_assignments) = self.function_body(
-            &mut x.parameters,
-            mem::take(&mut x.body),
-            &decorators,
-            x.range,
-            x.is_async,
-            return_ann_with_range,
-            &func_name,
-            parent,
-            undecorated_idx,
-            class_key,
-        );
+        let (stub_or_impl, placeholder_body_kind, is_return_inferred, self_assignments) = self
+            .function_body(
+                &mut x.parameters,
+                mem::take(&mut x.body),
+                &decorators,
+                x.range,
+                x.is_async,
+                return_ann_with_range,
+                &func_name,
+                parent,
+                undecorated_idx,
+                class_key,
+            );
 
         // Pop the annotation scope to get back to the parent scope, and handle this
         // case where we need to track assignments to `self` from methods.
@@ -807,6 +837,8 @@ impl<'a> BindingsBuilder<'a> {
                 def_index: func_def_index,
                 def: FunctionDefData::new(x),
                 stub_or_impl,
+                placeholder_body_kind,
+                is_return_inferred,
                 class_key,
                 decorators: decorators.decorators,
                 legacy_tparams: legacy_tparams.into_boxed_slice(),
