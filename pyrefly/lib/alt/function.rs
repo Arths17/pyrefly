@@ -19,73 +19,71 @@ use pyrefly_types::callable::Params;
 use pyrefly_types::callable::PlaceholderBodyKind;
 use pyrefly_types::class::Class;
 use pyrefly_types::class::ClassType;
+        let has_return_annotation = self.bindings().function_has_return_annotation(&stmt.name);
 use pyrefly_types::dimension::SizeExpr;
-use pyrefly_types::quantified::Quantified;
-use pyrefly_types::quantified::QuantifiedOrigin;
-use pyrefly_types::type_var::Restriction;
-use pyrefly_types::types::AnyStyle;
-use pyrefly_types::types::BoundMethod;
-use pyrefly_types::types::BoundMethodType;
-use pyrefly_types::types::TParams;
-use pyrefly_types::types::TParamsSource;
-use pyrefly_util::display::pluralize;
-use pyrefly_util::owner::Owner;
-use pyrefly_util::prelude::SliceExt;
-use pyrefly_util::visit::Visit;
-use ruff_python_ast::Expr;
-use ruff_python_ast::Identifier;
-use ruff_python_ast::UnaryOp;
-use ruff_python_ast::name::Name;
-use ruff_text_size::Ranged;
-use ruff_text_size::TextRange;
-use starlark_map::small_map::SmallMap;
-use starlark_map::small_set::SmallSet;
-use vec1::Vec1;
+        // `stmt.returns` is always set to None because the binding step calls `mem::take` on it
+        if !has_return_annotation && !def.metadata.flags.has_no_type_check {
+            self.error(
+                errors,
+                stmt.name.range(),
+                ErrorKind::UnannotatedReturn,
+                format!("`{}` is missing a return annotation", stmt.name),
+            );
+        }
 
-use crate::alt::answers::LookupAnswer;
-use crate::alt::answers_solver::AnswersSolver;
-use crate::alt::call::CallStyle;
-use crate::alt::call::CallTarget;
-use crate::alt::callable::CallArg;
-use crate::alt::types::decorated_function::DecoratedFunction;
-use crate::alt::types::decorated_function::Decorator;
-use crate::alt::types::decorated_function::SpecialDecorator;
-use crate::alt::types::decorated_function::UndecoratedFunction;
-use crate::binding::binding::Binding;
-use crate::binding::binding::FunctionDefData;
-use crate::binding::binding::FunctionParameter;
+        // The first parameter of a non-static method is the implicit self/cls
+        // parameter and does not require an annotation, regardless of its name.
+        // __new__ is an implicit staticmethod but still takes cls as its first parameter.
+        // If the first parameter is variadic (e.g. *args), self is passed inside it,
+        // so there is no separate implicit parameter to skip.
+        for (i, p) in stmt.parameters.iter().enumerate() {
+            // Skip first param if it's implicit self/cls and not variadic
+            if i == 0 && has_implicit_self_or_cls_param && !p.is_variadic() {
+                continue;
+            }
+            if p.annotation().is_none() {
+                let name = p.name().as_str();
+                self.error(
+                    errors,
+                    p.name().range(),
+                    ErrorKind::ImplicitAnyParameter,
+                    format!(
+                        "`{}` is missing an annotation for parameter `{name}`",
+                        stmt.name
+                    ),
+                );
 use crate::binding::binding::FunctionStubOrImpl;
+        }
 use crate::binding::binding::Key;
-use crate::binding::binding::KeyClass;
-use crate::binding::binding::KeyClassMetadata;
-use crate::binding::binding::KeyDecorator;
-use crate::binding::binding::KeyLegacyTypeParam;
-use crate::config::error_kind::ErrorKind;
-use crate::error::collector::ErrorCollector;
-use crate::error::context::TypeCheckContext;
-use crate::error::context::TypeCheckKind;
-use crate::solver::solver::QuantifiedHandle;
-use crate::types::callable::Callable;
-use crate::types::callable::DefaultValue;
-use crate::types::callable::FuncDefIndex;
-use crate::types::callable::FuncFlags;
-use crate::types::callable::FuncMetadata;
-use crate::types::callable::Function;
-use crate::types::callable::FunctionKind;
-use crate::types::callable::Param;
-use crate::types::callable::ParamList;
-use crate::types::callable::PrefixParam;
-use crate::types::callable::PropertyMetadata;
-use crate::types::callable::PropertyRole;
-use crate::types::callable::Required;
-use crate::types::class::ClassKind;
-use crate::types::keywords::DataclassTransformMetadata;
-use crate::types::types::CalleeKind;
-use crate::types::types::Forall;
-use crate::types::types::Forallable;
-use crate::types::types::Overload;
-use crate::types::types::OverloadType;
-use crate::types::types::Type;
+        // When self/cls has an explicit TypeVar annotation, using Self anywhere in the signature
+        // (return type or other parameters) is invalid because the TypeVar and Self create
+        // conflicting type parameterization.
+        // For classmethods, the annotation is `type[TFoo]`, so we also unwrap `Type::Type(...)`.
+        if has_implicit_self_or_cls_param
+            && !def.metadata.flags.is_staticmethod
+            && let Some(first_param) = def.params.first()
+            && {
+                let ty = first_param.as_type();
+                ty.is_explicit_type_variable()
+                    || matches!(ty, Type::Type(inner) if inner.is_explicit_type_variable())
+            }
+        {
+            let signature_contains_self = contains_self_type(&ret)
+                || def
+                    .params
+                    .iter()
+                    .skip(1)
+                    .any(|p| contains_self_type(p.as_type()));
+            if signature_contains_self {
+                self.error(
+                    errors,
+                    stmt.name.range(),
+                    ErrorKind::InvalidAnnotation,
+                    format!(
+                        "`Self` cannot be used when `{}` has an explicit TypeVar annotation",
+                        first_param.name().map_or("self", |n| n.as_str())
+                    ),
+                );
 
 /// Extract a display string for numeric default values whose types don't preserve
 /// the source spelling. This preserves both values that lose precision in the
@@ -1621,53 +1619,6 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         }
     }
 
-    fn decorator_missing_injected_parameter_message(
-        &self,
-        decorator: &Type,
-        decoratee_name: &Identifier,
-        decoratee: &Type,
-    ) -> Option<String> {
-        let decorator_name = decorator
-            .visit_toplevel_func_metadata(&|meta| Some(meta.kind.function_name().to_string()))?;
-        let expected_decoratee = decorator.callable_first_param(self.heap)?;
-        let expected_signature = expected_decoratee
-            .callable_signatures()
-            .into_iter()
-            .find(|signature| {
-                matches!(&signature.params, Params::ParamSpec(prefix, _) if !prefix.is_empty())
-            })?;
-
-        let actual_signature = match decoratee {
-            Type::Function(func) => &func.signature,
-            Type::Callable(callable) => callable.as_ref(),
-            _ => return None,
-        };
-
-        let Params::ParamSpec(prefix, _) = &expected_signature.params else {
-            return None;
-        };
-        let Params::List(actual_params) = &actual_signature.params else {
-            return None;
-        };
-        if actual_params.len() + 1 != prefix.len() {
-            return None;
-        }
-
-        let missing = prefix.get(actual_params.len())?;
-        let missing_ty = match missing {
-            PrefixParam::PosOnly(_, ty, Required::Required)
-            | PrefixParam::Pos(_, ty, Required::Required) => ty,
-            PrefixParam::PosOnly(_, _, Required::Optional(_))
-            | PrefixParam::Pos(_, _, Required::Optional(_)) => return None,
-        };
-        Some(format!(
-            "Function `{}` is missing parameter of type `{}` injected by decorator `{}`",
-            decoratee_name.as_str(),
-            self.for_display(missing_ty.clone()),
-            decorator_name,
-        ))
-    }
-
     fn apply_function_decorator(
         &self,
         decorator: Type,
@@ -1683,7 +1634,6 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         {
             return decoratee;
         }
-        let decorator_for_message = decorator.clone();
         let application = self.prepare_decorator_application(decorator, decoratee, range, errors);
         // Run a decorator call, buffering errors so we can decide between the primary
         // and Self-rewritten fallback without double-reporting.
@@ -1712,17 +1662,6 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             && fallback_errors.is_empty()
         {
             fallback_return
-        } else if let Some(message) = self.decorator_missing_injected_parameter_message(
-            &decorator_for_message,
-            decoratee_name,
-            &application.decoratee_arg,
-        ) {
-            self.error(
-                errors,
-                decoratee_name.range(),
-                ErrorKind::InvalidDecorator,
-                message,
-            )
         } else {
             errors.extend(primary_errors);
             primary_return

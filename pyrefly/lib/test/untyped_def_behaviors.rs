@@ -493,12 +493,12 @@ assert_type(f(0), Any)
 );
 
 testcase!(
-    test_no_type_check_without_return_annotation,
+    test_no_type_check_with_return_annotation,
     r#"
 from typing import no_type_check
 
 @no_type_check
-def f():
+def f() -> None:
     pass
 "#,
 );
